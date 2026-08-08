@@ -17,9 +17,18 @@ __pycache__/
 # Data & Checkpoints
 /data*/
 /checkpoint/
+/models/
+
+# Evaluation Outputs (BFCL, tau2-bench, etc. — large, regenerable)
+/results/
 
 # Libraries & Dependencies
 /lib/
+
+# Vendored clones (pulled at runtime by setup_*.sh; large, regenerable)
+/LLaMA-Factory/
+/src/eval/gorilla/
+/src/eval/tau2-bench/
 
 # Databases
 *.db

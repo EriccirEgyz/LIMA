@@ -64,10 +64,19 @@ if [ "$RUN_ALL" = false ] && [ -z "$DOMAIN" ]; then
 fi
 
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
 TAU2_DIR="$EVAL_DIR/tau2-bench"
-RESULTS_DIR="$EVAL_DIR/results"
 
-mkdir -p "$RESULTS_DIR"
+# Redirect tau2's output into our results tree instead of burying it inside the
+# vendored tau2-bench checkout (where it'd be lost on re-clone). tau2 uses one
+# DATA_DIR for both input (tau2/domains/...) and output (simulations/), so we
+# point TAU2_DATA_DIR at a per-checkpoint dir and symlink the input data in.
+# Override the location with TAU2_RUN_ROOT=...
+RESULTS_TAG=${RESULTS_TAG:-$(basename "$AGENT_MODEL")}
+TAU2_RUN_ROOT=${TAU2_RUN_ROOT:-"$REPO_ROOT/results/tau2/$RESULTS_TAG"}
+export TAU2_DATA_DIR="$TAU2_RUN_ROOT"
+mkdir -p "$TAU2_DATA_DIR"
+ln -sfn "$TAU2_DIR/data/tau2" "$TAU2_DATA_DIR/tau2"   # input data via symlink
 
 # === Validate ===
 if [ ! -d "$TAU2_DIR" ]; then
@@ -111,7 +120,7 @@ for d in "${DOMAINS[@]}"; do
     echo ""
     echo ">>> Running domain: $d"
 
-    SAVE_NAME="envfactory_1.7b_${d}_${TIMESTAMP}"
+    SAVE_NAME="${d}_${TIMESTAMP}"
 
     uv run tau2 run \
         --domain "$d" \
@@ -124,9 +133,10 @@ for d in "${DOMAINS[@]}"; do
         --seed 300 \
         --save-to "$SAVE_NAME"
 
-    echo ">>> Domain $d complete. Results saved to: data/simulations/$SAVE_NAME"
+    echo ">>> Domain $d complete. Results saved to: $TAU2_DATA_DIR/simulations/$SAVE_NAME"
 done
 
 echo ""
 echo "=== All evaluations complete ==="
-echo "View results: cd $TAU2_DIR && uv run tau2 view"
+echo "Results root: $TAU2_RUN_ROOT"
+echo "View results: TAU2_DATA_DIR=$TAU2_DATA_DIR uv run --project $TAU2_DIR tau2 view"
