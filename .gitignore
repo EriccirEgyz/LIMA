@@ -25,10 +25,27 @@ __pycache__/
 # Libraries & Dependencies
 /lib/
 
-# Vendored clones (pulled at runtime by setup_*.sh; large, regenerable)
-/LLaMA-Factory/
+# Unmodified vendored eval clones — re-cloned by setup_*.sh (not committed)
 /src/eval/gorilla/
 /src/eval/tau2-bench/
+
+# LLaMA-Factory & verl ARE committed as source (modified for this repro),
+# but their weights / generated data / run artifacts are excluded:
+LLaMA-Factory/models/
+verl/data/env_factory_rl.json
+**/log_rollout/
+**/outputs/
+**/tensorboard_log/
+**/checkpoints/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Virtualenvs & caches (never commit)
+.venv/
+.venv-sft/
+.cache/
 
 # Databases
 *.db

@@ -1,0 +1,8 @@
+interaction:
+  - name: "user"
+    class_name: "EnvFactory.interaction.user_interaction.UserInteraction"
+    config:
+      temperature: 0.6
+      top_p: 0.95
+      presence_penalty: 1.5
+      max_retry: 3

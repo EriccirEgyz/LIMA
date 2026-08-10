@@ -1,0 +1,51 @@
+### ============================================================
+### EnvFactory SFT 复现 — 冒烟测试 (smoke)  [方案A: LLaMA-Factory 仓库内]
+### 目的：300 条小数据验证整条 pipeline
+###       （数据 / history / system / mask_history / qwen3 / full FT / bf16）
+### 基于论文 configs/llamafactory_sft.yaml，关键超参沿用，仅做冒烟精简。
+###
+### 运行（在 LLaMA-Factory 根目录）：
+###   CUDA_VISIBLE_DEVICES=<idx> \
+###   CUDA_HOME=/workspace/shenchengyu/miniconda3/envs/envfactory-sft \
+###   /workspace/shenchengyu/miniconda3/envs/envfactory-sft/bin/llamafactory-cli train \
+###     llamafactory_runs/qwen3-1.7b_full_smoke/sft.yaml
+### ============================================================
+
+### model
+model_name_or_path: /workspace/shenchengyu/yizhigao/envfactory_repro/models/Qwen3-1.7B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+# deepspeed: 冒烟不用（单卡）
+
+### dataset
+dataset: env_factory_sft
+dataset_dir: data                # 相对 LLaMA-Factory 根目录
+template: qwen3
+mask_history: true               # history 不计入 loss（论文同，关键）
+cutoff_len: 16384                # 论文同（system prompt ~15KB）
+max_samples: 300                 # 冒烟：小数据
+overwrite_cache: true
+preprocessing_num_workers: 1
+dataloader_num_workers: 1
+
+### output
+output_dir: models/qwen3-1.7b/sft_smoke
+logging_steps: 2                 # 冒烟：短训练多打 loss 点
+plot_loss: true
+overwrite_output_dir: true
+save_strategy: "no"              # 冒烟：不存 checkpoint
+report_to: none                  # 冒烟：不接 tensorboard
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4   # 冒烟：比论文 256 小，快点出 loss
+learning_rate: 1.0e-6            # 论文同
+num_train_epochs: 1              # 论文同
+lr_scheduler_type: cosine        # 论文同
+warmup_ratio: 0.1                # 论文同
+bf16: true                       # 论文同
+gradient_checkpointing: true     # 冒烟求稳（防 16384 OOM）

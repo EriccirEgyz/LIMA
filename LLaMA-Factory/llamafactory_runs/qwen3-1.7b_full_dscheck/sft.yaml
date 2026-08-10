@@ -1,0 +1,40 @@
+### deepspeed ZeRO-3 + 无 gradient_checkpointing 验证（开正式长跑前的 2 分钟保险）
+### 与正式配置同款 deepspeed/no-checkpointing，仅 max_samples 极小 + grad_accum 小，快速跑几个 step。
+
+### model
+model_name_or_path: /workspace/shenchengyu/yizhigao/envfactory_repro/models/Qwen3-1.7B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+
+### dataset
+dataset: env_factory_sft
+dataset_dir: data
+template: qwen3
+mask_history: true
+cutoff_len: 16384
+max_samples: 32
+overwrite_cache: true
+preprocessing_num_workers: 1
+dataloader_num_workers: 1
+
+### output
+output_dir: models/qwen3-1.7b/dscheck
+logging_steps: 1
+plot_loss: false
+overwrite_output_dir: true
+save_strategy: "no"
+report_to: none
+
+### train（不开 gradient_checkpointing，与正式 run 一致，测真实显存）
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 4
+learning_rate: 1.0e-6
+num_train_epochs: 1
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true

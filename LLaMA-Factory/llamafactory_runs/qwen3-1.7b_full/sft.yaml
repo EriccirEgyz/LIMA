@@ -1,0 +1,67 @@
+### ============================================================
+### EnvFactory SFT 复现 — 正式 1.7B 全量 (full reproduction)  [方案A: LLaMA-Factory 仓库内]
+### 完全对齐论文 configs/llamafactory_sft.yaml（deepspeed ZeRO-3 / output / train），
+### 仅按单卡复现调整 effective batch：原文 8卡×1×32=256 → 单卡 1×1×256=256。
+### 梯度累积使单卡 effective batch 256 与原文等价，结果在论文指标正常波动内一致。
+###
+### 运行（单卡；deepspeed 必须先激活 conda env + FORCE_TORCHRUN=1，否则报错）：
+###   source /workspace/shenchengyu/miniconda3/etc/profile.d/conda.sh && conda activate envfactory-sft
+###   cd /workspace/shenchengyu/yizhigao/envfactory_repro/LLaMA-Factory
+###   FORCE_TORCHRUN=1 CUDA_VISIBLE_DEVICES=<idx> CUDA_HOME=$CONDA_PREFIX \
+###     HF_HOME=/workspace/shenchengyu/hf-home TMPDIR=/workspace/shenchengyu/tmp \
+###     llamafactory-cli train llamafactory_runs/qwen3-1.7b_full/sft.yaml
+###
+### 看训练曲线（在 conda env 内跑；远程访问需 ssh -L 6006:localhost:6006 转发）：
+###   conda activate envfactory-sft && tensorboard --logdir models/qwen3-1.7b/env_factory_sft --port 6006
+###
+### 2 卡加速（保持 effective batch=256，wall-clock 减半）：
+###   把 gradient_accumulation_steps 改成 128，并 CUDA_VISIBLE_DEVICES=0,1
+###   （LLaMA-Factory 自动 torchrun；2×1×128=256，ZeRO-3 跨 2 卡切分）
+### 8B 复现：把 model_name_or_path 换成 Qwen3-8B 即可（其余不变，8B 需 ZeRO-3）
+###
+### 注1：transformers 默认用 SDPA（内存高效注意力，无需 flash-attn 包），
+###      1.7B 在 16384 不开 gradient_checkpointing 约 ~47G，H100 80G 放得下。
+### 注2：ZeRO-3 已设 stage3_gather_16bit_weights_on_model_save=true，
+###      存出的 ckpt 含可直接加载的模型权重，能直接做 BFCL 评测。
+### ============================================================
+
+### model
+model_name_or_path: /workspace/shenchengyu/yizhigao/envfactory_repro/models/Qwen3-1.7B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json   # 相对 LLaMA-Factory 根目录
+
+### dataset
+dataset: env_factory_sft
+dataset_dir: data                # 相对 LLaMA-Factory 根目录
+template: qwen3
+mask_history: true               # history 不计入 loss（论文同）
+cutoff_len: 16384                # 论文同
+max_samples: 1000000             # 论文同（= 全量 26463）
+overwrite_cache: true
+preprocessing_num_workers: 1     # 论文同
+dataloader_num_workers: 1        # 论文同
+
+### output（对齐论文）
+output_dir: models/qwen3-1.7b/env_factory_sft
+logging_steps: 10                # 论文同
+save_steps: 30                   # 论文同（注：save_strategy=epoch 时此项被忽略，no-op）
+plot_loss: true                  # 论文同
+overwrite_output_dir: true       # 论文同
+save_only_model: false           # 论文同（存完整训练状态，可断点续训；~24G）
+report_to: tensorboard           # 论文同（已装 tensorboard 2.21.0）
+save_strategy: epoch             # 论文同（3 epoch → 每 epoch 存 1 个 ckpt，共 3 个；论文取 epoch-1 做 RL 冷启动）
+
+### train（对齐论文）
+per_device_train_batch_size: 1   # 论文同
+gradient_accumulation_steps: 256 # 单卡复现 effective batch=256（= 原文 8卡×1×32）
+learning_rate: 1.0e-6            # 论文同
+num_train_epochs: 3              # 论文同（论文 SFT 训 3 epoch；RL 从 epoch-1 ckpt 初始化）
+lr_scheduler_type: cosine        # 论文同
+warmup_ratio: 0.1                # 论文同
+bf16: true                       # 论文同
+ddp_timeout: 180000000           # 论文同（DDP 进程组超时；单卡无害）

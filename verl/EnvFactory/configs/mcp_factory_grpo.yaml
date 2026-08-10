@@ -1,0 +1,42 @@
+hydra:
+  searchpath:
+    - file://verl/trainer/config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  max_prompt_length: 16384
+  max_response_length: 4096
+  return_raw_chat: True
+  truncation: error
+  filter_overlong_prompts: False
+  reward_scheduler:
+    mode: fix
+    start_ratio: 0.9
+    end_ratio: 0.1
+    default_ratio: 0.5
+  apply_chat_template_kwargs:
+    enable_thinking: True
+  shuffle: True
+
+actor_rollout_ref:
+  hybrid_engine: True
+  model:
+    trust_remote_code: True
+    use_remove_padding: True
+  actor:
+    strategy: fsdp
+  rollout:
+    name: sglang
+    multi_turn:
+      enable: true
+      max_user_turns: 10
+      max_assistant_turns: 10
+      max_tool_response_length: 512
+      tool_response_truncate_side: middle
+  ref:
+    log_prob_micro_batch_size_per_gpu: 8
+    fsdp_config:
+      param_offload: True
