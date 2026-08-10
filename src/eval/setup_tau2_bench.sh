@@ -15,7 +15,7 @@ set -e
 
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 TAU2_DIR="$EVAL_DIR/tau2-bench"
-PINNED_TAG="v1.0.0"
+PINNED_TAG="v1.0.1"
 # Override the clone URL if github over HTTPS is blocked (e.g. behind a firewall
 # that terminates TLS on 443). Point it at an SSH remote that works for you:
 #   TAU2_REPO_URL="git@github-gyz:sierra-research/tau2-bench.git" bash setup_tau2_bench.sh
