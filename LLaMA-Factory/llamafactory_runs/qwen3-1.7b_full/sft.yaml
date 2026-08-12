@@ -51,7 +51,7 @@ output_dir: models/qwen3-1.7b/env_factory_sft
 logging_steps: 10                # 论文同
 save_steps: 30                   # 论文同（注：save_strategy=epoch 时此项被忽略，no-op）
 plot_loss: true                  # 论文同
-overwrite_output_dir: true       # 论文同
+overwrite_output_dir: false      # ⚠️ 续跑必须 false：true 会让 LLaMA-Factory 跳过自动 resume（hparams/parser.py:579 的 not overwrite_output_dir 条件），从头重训并覆盖 checkpoint-104；论文是连续一次跑完用 true，这里因中断续跑故改为 false
 save_only_model: false           # 论文同（存完整训练状态，可断点续训；~24G）
 report_to: tensorboard           # 论文同（已装 tensorboard 2.21.0）
 save_strategy: epoch             # 论文同（3 epoch → 每 epoch 存 1 个 ckpt，共 3 个；论文取 epoch-1 做 RL 冷启动）

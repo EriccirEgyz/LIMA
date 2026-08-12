@@ -28,6 +28,14 @@ MODEL=${MODEL:-"LARK-Lab/EnvFactory-1.7B"}
 PORT=${PORT:-8000}
 GPU_IDS=${GPU_IDS:-"0,1"}
 TP=${TP:-2}
+# Default float32 (NOT bf16): SFT-1.7B in bf16 spuriously emits an extra '}' at the
+# end of tool_call JSON ("}}}" instead of "}}"). sglang's hermes tool-call parser
+# then fails -> tau2 sees an empty AssistantMessage -> retail tasks die first turn
+# with "AssistantMessage must have either content or tool_calls". Same weights are
+# clean under float32 (greedy stays on the right side of the }} vs <|im_end|> logit
+# boundary). ~2x slower/VRAM, fine for 1.7B on H100. mem-fraction-static stays 0.9;
+# if float32 OOMs, lower it manually.
+DTYPE=${DTYPE:-bfloat16}
 
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
@@ -55,7 +63,8 @@ python -m sglang.launch_server \
   --model-path "$MODEL" \
   --port $PORT \
   --tp-size $TP \
-  --dtype bfloat16 \
+  --dtype $DTYPE \
   --mem-fraction-static 0.9 \
   --trust-remote-code \
-  --reasoning-parser qwen3
+  --reasoning-parser qwen3 \
+  --tool-call-parser hermes
