@@ -37,6 +37,14 @@ actor_rollout_ref:
       max_tool_response_length: 512
       tool_response_truncate_side: middle
   ref:
+    # Sizes the REF model's log-prob forward, used for the KL term (actor.use_kl_loss=True).
+    # Distinct from actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu in
+    # run_qwen3_1.7b_rl.sh, which sizes the ACTOR's forward -- both were 8 and both were
+    # lowered to 2, since each independently OOMs at the same shape (sequences up to
+    # 16384+8192, with sglang holding its pool because free_cache_engine=False).
+    # param_offload below keeps ref weights on CPU, but activations still land on the GPU.
+    # This is a no_grad forward: smaller micro-batches only add loop iterations, the KL is
+    # unchanged. Costs ~7% of step time (timing_s/ref was ~520s of ~7250s).
     log_prob_micro_batch_size_per_gpu: 8
     fsdp_config:
       param_offload: True

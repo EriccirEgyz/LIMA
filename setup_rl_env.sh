@@ -83,6 +83,28 @@ echo "===== [align] re-pin verl-compatible versions (sglang/step-6 pulled newer)
 # final environment matches the verl 0.6 known-good stack.
 pip install --no-input "numpy<2.0.0" "transformers==4.55.4" "tensordict==0.10.0" "scipy<1.16"
 
+# uvicorn MUST stay <=0.40.x -- REQUIRED for actor_rollout_ref.rollout.free_cache_engine=True.
+# verl 0.6.1's run_unvicorn (verl/workers/rollout/utils.py) does:
+#     server.should_exit = True
+#     await server.serve()
+#     server_task = asyncio.create_task(server.main_loop())
+# In uvicorn <=0.40.0, Server._serve() honours that as
+#     await self.startup(...); if self.should_exit: return
+# i.e. it returns with the LISTENING SOCKET STILL OPEN, which is exactly what verl assumes.
+# uvicorn 0.41.0 changed _serve() to fall through instead:
+#     if not self.should_exit: await self.main_loop()
+#     if self.started:         await self.shutdown(...)   # <-- closes the listening socket
+# so with >=0.41 the sglang HTTP server stops accepting immediately after launch. Token
+# generation still works (SGLangHttpServer.generate() calls tokenizer_manager in-process and
+# never uses HTTP), but release_memory_occupation / resume_memory_occupation DO go over HTTP,
+# so free_cache_engine=True died in init with "Connection error ... x3" -> RuntimeError.
+# That is not a startup race: no retry/backoff helps once the socket is closed.
+# 0.40.0 is the newest release with the old semantics AND satisfies fastmcp's uvicorn>=0.35,
+# so it must be installed AFTER fastmcp (step 8) or fastmcp will pull a >=0.41 wheel.
+# Verified 2026-08-13: with 0.40.0 the UNMODIFIED verl run_unvicorn keeps the port open
+# (two consecutive GET /health -> 200); with 0.52.1 the same code gets ECONNREFUSED.
+pip install --no-input "uvicorn==0.40.0"
+
 echo "===== [optional] flash_attn==2.7.4.post1 (source build; needs nvcc, ~10-15 min) ====="
 # No prebuilt wheel exists for flash_attn 2.7.4.post1 + torch2.8 + cp312, so build from
 # source against the installed torch (matches the verl 0.6 Docker). Skip by setting

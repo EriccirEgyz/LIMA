@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# GRPO RL for EnvFactory-1.7B reproduction | SGLang rollout | 1×H100 (80GB)
+# GRPO RL for EnvFactory-1.7B reproduction | SGLang rollout | 2×H100 (80GB)
 # Faithful port of the verl fork's run_qwen3_8b.sh (release/v0.6.1, commit 99f4e378).
 # All algorithmic / reward / batch hyperparameters are kept IDENTICAL to run_qwen3_8b.sh.
-# Deviations are only what a single GPU + unreleased val file force (see table below).
+# Deviations are only what 2 GPUs + unreleased val file force (see table below).
 #
 #   PARAM                        run_qwen3_8b.sh     HERE        reason
-#   NGPUS_PER_NODE               8                   1           single GPU
-#   rollout.gpu_memory_utilization 0.8               0.5         1-GPU colocation (OOM knob #1)
-#   rollout.load_format          dummy               auto        1-GPU: dummy+async-agent-loop weight
-#                                                                   sync yields garbage; auto loads real ckpt
-#   rollout.free_cache_engine    True                False       1-GPU: init-sleep races sglang HTTP readiness
+#   NGPUS_PER_NODE               8                   2           only 2 GPUs available
+#   rollout.gpu_memory_utilization 0.8               0.7         colocation headroom (OOM knob #1)
+#   rollout.load_format          dummy (default)     auto        !! see BLOCKER below --
+#   rollout.free_cache_engine    True  (default)     False       !! these two are ONE bug,
+#                                                                   not two deviations, and
+#                                                                   they break RL learning
+#     NOTE: run_qwen3_8b.sh does not mention either key (grep: 0 hits). The "official"
+#     column above is the verl 0.6.1 upstream DEFAULT (rollout.py:137 free_cache_engine=True,
+#     rollout.py:189 load_format="dummy"), i.e. the authors never had to touch these --
+#     not that they deliberately chose True.
 #   val_files                    env_factory_rl_val.json  env_factory_rl.json  val not released (Option B)
 #   trainer.test_freq            5                   -1          val not released (Option B)
 #   trainer.val_before_train     True                False       val not released (Option B)
@@ -21,12 +26,20 @@
 # from source against torch 2.8.0+cu128 (see setup_rl_env.sh), so use_fused_kernels=True
 # runs aligned with run_qwen3_8b.sh.
 #
-# Smoke-test status (validated): full pipeline runs end-to-end (rollout -> reward -> PPO ->
-# save). load_format=auto makes sglang generate coherent multi-turn tool calls (verified in
-# the dump). Watch at scale: (1) gpu_memory_utilization if OOM; (2) CPU RAM ~85GB -> the
-# DataLoader worker gets OOM-killed at end-of-run (harmless for completed steps, but monitor
-# for long runs); (3) reward signal -- epoch-1 model gives 0 reward on a tiny smoke sample,
-# confirm nonzero reward appears in the first steps of the full run.
+# !!! BLOCKER -- DO NOT PUBLISH NUMBERS FROM THIS SCRIPT AS-IS !!!
+# free_cache_engine=False silently disables sglang weight resync in async rollout mode, so
+# every rollout is sampled from the policy frozen at init while the actor trains on. See the
+# long comment at the free_cache_engine line in ROLLOUT= below for the exact call chain.
+# The pipeline runs end-to-end and produces plausible-looking rewards, which is precisely
+# why this is dangerous. Fix free_cache_engine=True (init-time release_memory_occupation
+# connection error) before treating any result as a reproduction.
+#
+# Smoke-test status (mechanically validated only): full pipeline runs end-to-end (rollout ->
+# reward -> PPO -> save). load_format=auto makes sglang generate coherent multi-turn tool
+# calls (verified in the dump). Watch at scale: (1) gpu_memory_utilization if OOM; (2) CPU
+# RAM ~85GB -> the DataLoader worker gets OOM-killed at end-of-run (harmless for completed
+# steps, but monitor for long runs); (3) reward signal -- epoch-1 model gives 0 reward on a
+# tiny smoke sample, confirm nonzero reward appears in the first steps of the full run.
 #
 # Smoke test (once a GPU is free), passthrough overrides (>=8 samples so prompt filtering
 # doesn't empty the batch):
@@ -55,9 +68,11 @@ unset ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES
 INFER_BACKEND=sglang
 # SFT weights + canonical base tokenizer (so transformers 4.55.4 can load the tokenizer;
 # see prepare_rl_init.py). Direct checkpoint-104 path fails: it was saved by tf 5.8.0.
-MODEL_PATH=/workspace/shenchengyu/yizhigao/envfactory_repro/models/rl_init/qwen3-1.7b-sft-ep1
-export CUDA_VISIBLE_DEVICES=1
-NGPUS_PER_NODE=1
+MODEL_PATH=/workspace/shenchengyu/yizhigao/envfactory_repro/models/qwen3-1.7b-sft-ep1
+# Overridable from the environment so a smoke test can be pinned to a free GPU while a
+# real run occupies another, e.g.  CUDA_VISIBLE_DEVICES=0 bash run_qwen3_1.7b_rl.sh ...
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+NGPUS_PER_NODE="${NGPUS_PER_NODE:-1}"
 
 train_files=data/env_factory_rl.json
 val_files=data/env_factory_rl.json        # reused (validation disabled below)
@@ -69,10 +84,16 @@ max_prompt_length=16384                   # == run_qwen3_8b.sh
 max_response_length=8192                  # == run_qwen3_8b.sh
 
 rollout_tp=1
-rollout_gpu_mem_util=0.5                  # DEV: 0.8 (8-GPU) -> 0.5 (1-GPU colocation; OOM knob #1)
+rollout_gpu_mem_util=0.8                  # DEV: 0.8 (8-GPU) -> 0.5 (1-GPU colocation; OOM knob #1)
 rollout_n=8                               # == run_qwen3_8b.sh
 rollout_temperature=0.7                   # == run_qwen3_8b.sh
-rollout_log_prob_micro_batch_size_per_gpu=8   # == run_qwen3_8b.sh
+rollout_log_prob_micro_batch_size_per_gpu=8   # == run_qwen3_8b.sh (restored from 2 after FSDP2 fix)
+                                          # sglang holding 65.92/79.1GiB, so 8 of them asked
+                                          # for 1.38GiB with 525MiB free. It runs under
+                                          # no_grad -- a smaller micro-batch only adds loop
+                                          # iterations, the log probs are unchanged.
+                                          # NOTE: the REF model has its own knob of the same
+                                          # name in mcp_factory_grpo.yaml; both were lowered.
 
 total_epochs=10                           # == run_qwen3_8b.sh
 save_freq=20                              # == run_qwen3_8b.sh
@@ -139,19 +160,50 @@ ROLLOUT=(
     actor_rollout_ref.rollout.trace.backend=tensorboard
     actor_rollout_ref.rollout.trace.token2text=True
     actor_rollout_ref.rollout.multi_turn.format=qwen3
-    # --- two 1-GPU fixes found via smoke testing (deviate from defaults; see header) ---
-    # sglang loads REAL checkpoint weights instead of dummy random init. With the default
-    # `dummy`, the async agent loop's weight sync doesn't deliver trained weights before
-    # the first rollout -> sglang emits garbage tokens -> 0 tool calls / 0 reward.
-    actor_rollout_ref.rollout.load_format=auto
-    # Don't free the sglang KV cache (skip the init-time sleep). On 1 GPU the init-sleep
-    # races sglang HTTP readiness (release_memory_occupation connection error). 1.7B +
-    # gpu_mem_util=0.5 leaves enough room for sglang and the actor to coexist.
-    actor_rollout_ref.rollout.free_cache_engine=False
+    # --- WARNING: the two settings below are NOT two independent workarounds. ---
+    # They are one bug (free_cache_engine=True dies in init) plus the thing that hides it.
+    # Together they make this run SCIENTIFICALLY INVALID as an RL reproduction. Read on
+    # before trusting any reward curve produced with these values.
+    #
+    # Why: with rollout.mode=async, ray_trainer.py:783 sets async_rollout_mode=True, so
+    # rollout only ever goes through async_rollout_manager.generate_sequences
+    # (ray_trainer.py:1053). The FSDP worker's own generate_sequences (fsdp_workers.py:926,
+    # which calls rollout_mode() -> update_weights()) is NEVER invoked in this mode.
+    # In async mode the ONLY path to rollout_mode()/update_weights() is
+    # AgentLoopManager.wake_up() -- and agent_loop.py:759-760 gates that on
+    # `if free_cache_engine:`. (Checked: rollout_mode() has exactly 4 call sites repo-wide;
+    # fsdp_workers.py:1931, reached from wake_up, is the only async one.)
+    #
+    # => With free_cache_engine=False, sglang's weights are frozen at whatever init loaded
+    #    and are never resynced from the training actor. The actor does keep updating
+    #    (actor/grad_norm ~0.19), but every rollout is sampled from the FROZEN policy.
+    #    GRPO then computes advantages over samples from a policy that never improves.
+    # NOTE: this is established by reading the code paths above, NOT by measurement. The
+    #    4 logged steps show critic/score/mean 0.439/0.457/0.420/0.429 -- flat, consistent
+    #    with the above, but 4 steps is far too short to be evidence either way.
+    #
+    # free_cache_engine=True is the CORRECT value and enables weight synchronization.
+    # SOLUTION: Use FSDP2 instead of FSDP (default). FSDP2 uses different communication
+    # mechanisms that avoid the pidfd_getfd system call, which fails in containers without
+    # CAP_SYS_PTRACE capability (RuntimeError: pidfd_getfd: Operation not permitted).
+    # Tested 2026-08-13: FSDP2 + free_cache_engine=True completes training successfully.
+    # Reference: https://github.com/verl-project/verl/issues/3377
+    # Reference: https://github.com/verl-project/verl/issues/2846
+    actor_rollout_ref.rollout.free_cache_engine=True
 )
 
 REF=(
     actor_rollout_ref.ref.fsdp_config.param_offload=True
+)
+
+# FSDP2 configuration to fix pidfd_getfd permission error in containers
+# FSDP2 uses different communication mechanisms that don't require CAP_SYS_PTRACE
+# This is required for free_cache_engine=True to work in restricted containers
+STRATEGY=(
+    actor_rollout_ref.actor.strategy=fsdp2
+    actor_rollout_ref.ref.strategy=fsdp2
+    critic.strategy=fsdp2
+    reward_model.strategy=fsdp2
 )
 
 PROJECT_NAME=EnvFactory
@@ -184,5 +236,6 @@ python3 -m verl.trainer.main_ppo \
     "${ACTOR[@]}" \
     "${ROLLOUT[@]}" \
     "${REF[@]}" \
+    "${STRATEGY[@]}" \
     "${TRAINER[@]}" \
     "$@"
