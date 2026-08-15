@@ -19,6 +19,11 @@
 #   trainer.test_freq            5                   -1          val not released (Option B)
 #   trainer.val_before_train     True                False       val not released (Option B)
 #   model.path                   (theirs)            rl_init dir SFT epoch-1 ckpt + canonical tokenizer
+#   actor.use_dynamic_bsz        False (default)     True        13.7% MFU from padding waste;
+#   actor.ppo_max_token_len_per_gpu  -               49152         NOT gradient-neutral, but a
+#                                                                  smaller perturbation than
+#                                                                  changing micro_bsz. Details
+#                                                                  at the use_dynamic_bsz line.
 #   everything else (256/64/2, n=8, lr=1e-6, kl=0.001,            identical
 #     10 epochs, scheduler fix/0.5, grpo, fused_kernels ...)
 #
@@ -79,26 +84,71 @@ val_files=data/env_factory_rl.json        # reused (validation disabled below)
 
 train_batch_size=256                      # == run_qwen3_8b.sh
 ppo_mini_batch_size=64                    # == run_qwen3_8b.sh
-ppo_micro_batch_size_per_gpu=2            # == run_qwen3_8b.sh
+ppo_micro_batch_size_per_gpu=2            # == run_qwen3_8b.sh (unused when dynamic bsz is on)
 max_prompt_length=16384                   # == run_qwen3_8b.sh
 max_response_length=8192                  # == run_qwen3_8b.sh
 
+# --- micro-batching: token-budget instead of fixed sequence count (perf, see below) ---
+# Measured: update_actor spent 1901s/step at ~103 TFLOP/s (6*N*T = 196 PFLOP over 19.0M
+# tokens), i.e. MFU 13.7% against ~756 TFLOP/s bf16 on an H100 PCIe. Cause is padding waste:
+# a fixed 2 sequences per micro-batch pads to the longest member, and lengths here are very
+# uneven (prompt mean 5741 / max 15701, response mean 3553 / max 8192).
+#
+# NEITHER this nor raising ppo_micro_batch_size_per_gpu is gradient-neutral under
+# loss_agg_mode=token-mean (the default). Per micro-batch the loss is masked_mean = sum_i/T_i,
+# divided by THAT micro-batch's own token count, so:
+#   static  (dp_actor.py:436): loss_scale = 1/grad_accum, a constant -> every micro-batch gets
+#           equal weight no matter how many tokens it holds, so token-light micro-batches are
+#           upweighted per token. Changing micro_bsz changes both grad_accum AND the grouping.
+#   dynamic (dp_actor.py:434): loss_scale = n_seqs_in_mb / ppo_mini_batch_size -> reweights by
+#           sequence count, and leaves mini-batch boundaries and optimizer-step count alone.
+# Dynamic is preferred as the smaller perturbation: it only re-buckets micro-batches WITHIN an
+# unchanged mini-batch, whereas micro_bsz alters the global grad_accum constant.
+#
+# Note the 1-GPU run already departs from run_qwen3_8b.sh here regardless: fsdp_workers.py:236
+# normalizes ppo_mini_batch_size by world size, so 64*8//8 = 64 (grad_accum 32, 8 optimizer
+# steps/step) on 8 GPUs vs 64*8//1 = 512 (grad_accum 256, 1 optimizer step/step) on 1 GPU.
+# Keeping micro_bsz=2 does not recover that; it is lost to the GPU count.
+use_dynamic_bsz=True
+# Two separate lower bounds:
+#   code floor     24576 = max_prompt 16384 + max_response 8192. Below this,
+#                  rearrange_micro_batches asserts outright (seqlen_balancing.py:295).
+#   verl docs floor 49152 = 2 * (max_prompt + max_response), the documented rule of thumb;
+#                  the docs then say to raise it further for throughput.
+#                  https://verl.readthedocs.io/en/latest/perf/perf_tuning.html
+# 49152 is therefore the RECOMMENDED MINIMUM, not an aggressive setting. It is ~2.6x the
+# current static load (~18589 tokens/micro-batch: 19.0M/2048 = 9294 per sequence x 2).
+# Raise toward 65536 (~3.5x) / 98304 (~5.3x) if the optimizer step has headroom -- non-rollout
+# phases were observed under 40GB while sglang holds ~40GB via gpu_memory_utilization=0.5.
+# If it OOMs, 24576 still runs (~1.3x) but is below the documented recommendation.
+ppo_max_token_len_per_gpu=49152
+# Forward-only budget for old_log_prob (327s/step) and ref (376s/step). Those two run under
+# no_grad, so they hold no activations for backward and the docs allow ~2x the training limit.
+# Kept at 1x (the same budget as training) deliberately: it is the conservative choice, and
+# ref runs with param_offload=True so its memory profile differs from the actor's. Raise to
+# 98304 once the 49152 training budget is confirmed to fit.
+#
+# These are set explicitly below rather than left to interpolation. verl defaults them to
+# ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}
+# (_generated_ppo_trainer.yaml:118 and :195), i.e. they would silently inherit the actor value
+# anyway -- but that inheritance is invisible when reading this script. Both lines below use
+# the same shell variable, so there is still exactly one number to edit.
+log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+
 rollout_tp=1
-rollout_gpu_mem_util=0.8                  # DEV: 0.8 (8-GPU) -> 0.5 (1-GPU colocation; OOM knob #1)
+rollout_gpu_mem_util=0.5                  # DEV: 0.8 (8-GPU) -> 0.7 (1-GPU colocation; OOM knob #1)
 rollout_n=8                               # == run_qwen3_8b.sh
 rollout_temperature=0.7                   # == run_qwen3_8b.sh
-rollout_log_prob_micro_batch_size_per_gpu=8   # == run_qwen3_8b.sh (restored from 2 after FSDP2 fix)
-                                          # sglang holding 65.92/79.1GiB, so 8 of them asked
-                                          # for 1.38GiB with 525MiB free. It runs under
-                                          # no_grad -- a smaller micro-batch only adds loop
-                                          # iterations, the log probs are unchanged.
-                                          # NOTE: the REF model has its own knob of the same
-                                          # name in mcp_factory_grpo.yaml; both were lowered.
+rollout_log_prob_micro_batch_size_per_gpu=8
 
 total_epochs=10                           # == run_qwen3_8b.sh
-save_freq=20                              # == run_qwen3_8b.sh
+save_freq=2                              # == run_qwen3_8b.sh
 test_freq=-1                              # DEV: 5 -> -1 (val not released)
 val_before_train=False                    # DEV: True -> False (val not released)
+
+PROJECT_NAME=EnvFactory
+#EXPERIMENT_NAME=${PROJECT_NAME}-RL-$(date +%Y%m%d-%H%M%S) 不建议带时间戳，方便续训
+EXPERIMENT_NAME=${PROJECT_NAME}-RL-0815
 ########################### end user-adjustable ###########################
 
 ALGORITHM=(
@@ -141,6 +191,8 @@ ACTOR=(
     actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.ppo_mini_batch_size=${ppo_mini_batch_size}
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${ppo_micro_batch_size_per_gpu}
+    actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz}
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
     actor_rollout_ref.actor.use_kl_loss=True
     actor_rollout_ref.actor.kl_loss_coef=0.001
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
@@ -157,6 +209,10 @@ ROLLOUT=(
     actor_rollout_ref.rollout.n=${rollout_n}
     actor_rollout_ref.rollout.temperature=${rollout_temperature}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${rollout_log_prob_micro_batch_size_per_gpu}
+    # old_log_prob (327s/step). Stated explicitly instead of relying on the interpolated
+    # default at _generated_ppo_trainer.yaml:117-118; same value either way.
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz}
+    actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${log_prob_max_token_len_per_gpu}
     actor_rollout_ref.rollout.trace.backend=tensorboard
     actor_rollout_ref.rollout.trace.token2text=True
     actor_rollout_ref.rollout.multi_turn.format=qwen3
@@ -194,6 +250,10 @@ ROLLOUT=(
 
 REF=(
     actor_rollout_ref.ref.fsdp_config.param_offload=True
+    # ref log_prob (376s/step). Stated explicitly instead of relying on the interpolated
+    # default at _generated_ppo_trainer.yaml:194-195; same value either way.
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz}
+    actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${log_prob_max_token_len_per_gpu}
 )
 
 # FSDP2 configuration to fix pidfd_getfd permission error in containers
@@ -206,8 +266,6 @@ STRATEGY=(
     reward_model.strategy=fsdp2
 )
 
-PROJECT_NAME=EnvFactory
-EXPERIMENT_NAME=${PROJECT_NAME}-RL
 TRAINER=(
     trainer.critic_warmup=0
     trainer.logger='["console","tensorboard"]'
