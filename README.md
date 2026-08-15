@@ -89,7 +89,7 @@ Environment construction follows a **discovery-to-validation** pipeline:
 Schema Sketch  →  MCP Metadata  →  Executable Environment  →  Validation
 ```
 
-**1. Discover** new schema sketches with [`mcp-sketch-discovery`](mcp-sketch-discovery/SKILL.md). The workflow scans existing sketches, searches for non-AI utility APIs, and drafts new candidates under [`envs/schema_sketch`](envs/schema_sketch).
+**1. Discover** new schema sketches with [`mcp-sketch-discovery`](.agents/skills/mcp-sketch-discovery/SKILL.md). The workflow scans existing sketches, searches for non-AI utility APIs, and drafts new candidates under [`envs/schema_sketch`](envs/schema_sketch).
 
 **2. Generate** standardized MCP metadata from a schema sketch:
 
