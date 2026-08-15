@@ -80,9 +80,25 @@ def run_ppo(config, task_runner_class=None) -> None:
     use_fastmcp = os.environ.get("USE_FASTMCP", "TRUE").upper() == "TRUE"
     mcp_config_path = os.environ.get("MCP_CONFIG_PATH")
     assert mcp_config_path is not None, "MCP_CONFIG_PATH environment variable must be set inside .env."
+    # All rollouts share this ONE detached actor for every tool call
+    # (tool_agent_loop.py: `await mcp_manager_actor.call_tool.remote(...)`). Every method on
+    # the actor class is sync, so Ray treats it as a threaded actor and defaults it to
+    # DEFAULT_MAX_CONCURRENCY_THREADED == 1 -- i.e. the tool calls of all
+    # train_batch_size * rollout.n rollouts execute one at a time. Measured cost of the tool
+    # itself is 0.65s (subprocess spawn) + ~10ms (call), but per-rollout `tool_calls` timing
+    # was 1065s, almost entirely queueing behind that single thread.
+    # Raising max_concurrency is pure infrastructure -- it changes no algorithmic
+    # hyperparameter. Measured on this exact nesting (sync actor methods delegating to
+    # MCPManager's background event loop): 1.5 calls/s at the default vs 91.5 calls/s at 64.
+    # Applied to the FastMCP path only. ToolManagerActor is NOT thread-safe: its work is
+    # genuinely blocking (no event loop to yield to) and ToolClient.connect() mutates the
+    # shared sys.modules via importlib, so extra threads would race there for no gain.
+    mcp_max_concurrency = int(os.environ.get("MCP_ACTOR_MAX_CONCURRENCY", "64"))
     if use_fastmcp:
         from EnvFactory.manager.mcp_manager import MCPManagerActor
-        mcp_actor = MCPManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
+        mcp_actor = MCPManagerActor.options(
+            name="mcp_manager_actor", lifetime="detached", max_concurrency=mcp_max_concurrency
+        ).remote()
     else:
         from EnvFactory.manager.tool_manager import ToolManagerActor
         mcp_actor = ToolManagerActor.options(name="mcp_manager_actor", lifetime="detached").remote()
