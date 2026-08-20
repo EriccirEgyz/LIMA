@@ -57,6 +57,8 @@ export CUDA_HOME="$REPO_ROOT/.venv/cuda-nvcc"
 export PATH="$CUDA_HOME/bin:$REPO_ROOT/.venv/bin:$PATH"
 # -----------------------------------------------------------------------------
 
+# 同卡上没有其它程序时，--mem-fraction-static可以设到0.9，有其它的话要降低一些，比如到0.7
+
 echo "=== Serving $MODEL on port $PORT (GPU: $GPU_IDS, TP=$TP) ==="
 
 python -m sglang.launch_server \
@@ -64,7 +66,7 @@ python -m sglang.launch_server \
   --port $PORT \
   --tp-size $TP \
   --dtype $DTYPE \
-  --mem-fraction-static 0.9 \
+  --mem-fraction-static 0.7 \
   --trust-remote-code \
   --reasoning-parser qwen3 \
   --tool-call-parser hermes

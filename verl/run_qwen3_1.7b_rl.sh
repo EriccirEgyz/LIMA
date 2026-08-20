@@ -105,10 +105,11 @@ max_response_length=8192                  # == run_qwen3_8b.sh
 # Dynamic is preferred as the smaller perturbation: it only re-buckets micro-batches WITHIN an
 # unchanged mini-batch, whereas micro_bsz alters the global grad_accum constant.
 #
-# Note the 1-GPU run already departs from run_qwen3_8b.sh here regardless: fsdp_workers.py:236
-# normalizes ppo_mini_batch_size by world size, so 64*8//8 = 64 (grad_accum 32, 8 optimizer
-# steps/step) on 8 GPUs vs 64*8//1 = 512 (grad_accum 256, 1 optimizer step/step) on 1 GPU.
-# Keeping micro_bsz=2 does not recover that; it is lost to the GPU count.
+# Note the run already departs from run_qwen3_8b.sh here regardless of this switch:
+# fsdp_workers.py:236 normalizes ppo_mini_batch_size by world size, so on 8 GPUs it is
+# 64*8//8 = 64 (grad_accum 32, 8 optimizer steps/step), while on this 2-GPU box it is
+# 64*8//2 = 256 (grad_accum 128, 2 optimizer steps/step). Keeping micro_bsz=2 does not
+# recover the 8-step structure; it is lost to the GPU count.
 use_dynamic_bsz=True
 # Two separate lower bounds:
 #   code floor     24576 = max_prompt 16384 + max_response 8192. Below this,
@@ -121,7 +122,9 @@ use_dynamic_bsz=True
 # Raise toward 65536 (~3.5x) / 98304 (~5.3x) if the optimizer step has headroom -- non-rollout
 # phases were observed under 40GB while sglang holds ~40GB via gpu_memory_utilization=0.5.
 # If it OOMs, 24576 still runs (~1.3x) but is below the documented recommendation.
-ppo_max_token_len_per_gpu=49152
+ppo_max_token_len_per_gpu=147456 
+# 147456 (6x(max_prompt_length + max_response_length)) 两卡大致占用60GB
+# 98304 (4x(max_prompt_length + max_response_length)) 两卡大致占用50GB以内
 # Forward-only budget for old_log_prob (327s/step) and ref (376s/step). Those two run under
 # no_grad, so they hold no activations for backward and the docs allow ~2x the training limit.
 # Kept at 1x (the same budget as training) deliberately: it is the conservative choice, and
@@ -133,10 +136,12 @@ ppo_max_token_len_per_gpu=49152
 # (_generated_ppo_trainer.yaml:118 and :195), i.e. they would silently inherit the actor value
 # anyway -- but that inheritance is invisible when reading this script. Both lines below use
 # the same shell variable, so there is still exactly one number to edit.
-log_prob_max_token_len_per_gpu=${ppo_max_token_len_per_gpu}
+log_prob_max_token_len_per_gpu=589824 # (24x(max_prompt_length + max_response_length))  
+# 491520 (20x(max_prompt_length + max_response_length)) 两卡大致占用45GB
+# 196608 (8x(max_prompt_length + max_response_length)) 两卡大致占用30GB以内
 
 rollout_tp=1
-rollout_gpu_mem_util=0.5                  # DEV: 0.8 (8-GPU) -> 0.7 (1-GPU colocation; OOM knob #1)
+rollout_gpu_mem_util=0.7                  # DEV: 0.8 (8-GPU) -> 0.7 (1-GPU colocation; OOM knob #1)
 rollout_n=8                               # == run_qwen3_8b.sh
 rollout_temperature=0.7                   # == run_qwen3_8b.sh
 rollout_log_prob_micro_batch_size_per_gpu=8
@@ -148,7 +153,7 @@ val_before_train=False                    # DEV: True -> False (val not released
 
 PROJECT_NAME=EnvFactory
 #EXPERIMENT_NAME=${PROJECT_NAME}-RL-$(date +%Y%m%d-%H%M%S) 不建议带时间戳，方便续训
-EXPERIMENT_NAME=${PROJECT_NAME}-RL-0815
+EXPERIMENT_NAME=${PROJECT_NAME}-RL-0818
 ########################### end user-adjustable ###########################
 
 ALGORITHM=(
