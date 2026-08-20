@@ -140,8 +140,11 @@ class MCPManager:
         name = tool_name.split("-")[-1]
         args = json.loads(tool_args) if isinstance(tool_args, str) else tool_args
 
-        # Hold the per-client lock across get_client + connect so concurrent calls for the
-        # same client_id share one subprocess instead of racing to spawn their own.
+        # Hold the per-client lock across get_client + connect + tool execution to ensure:
+        # 1. Concurrent calls for the same client_id share one subprocess (no race on spawn)
+        # 2. Tool calls to the same stateful server execute serially (no state race)
+        # This only serializes calls with the SAME client_id; cross-rollout parallelism is
+        # unaffected (different rollouts use different client_ids via unique request_id).
         lock = self.client_locks.setdefault(client_id, asyncio.Lock())
         async with lock:
             client, loaded = self.get_client(client_id)
@@ -150,7 +153,15 @@ class MCPManager:
 
             if not client.is_connected():
                 await client._connect()
-        result = await client.call_tool(name, args)
+
+            # Execute tool call inside the lock to prevent concurrent modifications
+            # to the same stateful MCP server's internal state (counters, dicts, etc.)
+            result = await client.call_tool(name, args)
+
+            # Update loaded flag after successful load_scenario execution
+            if name == "load_scenario" and client_id in self.clients:
+                self.clients[client_id]["loaded"] = True
+
         return ",".join(item.text for item in result.content if hasattr(item, "text"))
 
     def call_tool(self, client_id: str, tool_name: str, tool_args: dict | str):
