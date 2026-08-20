@@ -296,14 +296,38 @@ class ToolAgentLoop(AgentLoopBase):
         add_messages: list[dict[str, Any]] = []
         new_images_this_turn: list[Any] = []  # Local variable instead of agent_data attribute
 
-        tasks = []
+        # Helper function to execute calls for one server sequentially
+        async def run_group(indexed_calls):
+            """Execute tool calls for one server sequentially, preserving model output order.
+
+            This ensures that when the model outputs multiple calls to the same server
+            (e.g., Calendar-create_event then Calendar-update_event), they execute in that
+            order rather than racing to acquire the mcp_manager lock in unpredictable order.
+            """
+            results = []
+            for index, tool_call in indexed_calls:
+                response = await self._call_tool(tool_call, agent_data.tools_kwargs, agent_data)
+                results.append((index, response))
+            return results
+
+        # Group tool calls by server_name to ensure same-server calls execute in order
+        # while allowing different-server calls to run in parallel
+        groups = {}
         tool_call_names = []
-        for tool_call in agent_data.tool_calls:
-            tasks.append(self._call_tool(tool_call, agent_data.tools_kwargs, agent_data))
+        for index, tool_call in enumerate(agent_data.tool_calls):
+            server_name = tool_call.name.split("-")[0]
+            groups.setdefault(server_name, []).append((index, tool_call))
             tool_call_names.append(tool_call.name)
 
+        # Execute groups in parallel (different servers), but within each group sequentially
         with simple_timer("tool_calls", agent_data.metrics):
-            responses = await asyncio.gather(*tasks)
+            group_results = await asyncio.gather(*(run_group(group) for group in groups.values()))
+
+        # Reconstruct responses in original order to match agent_data.tool_calls
+        responses = [None] * len(agent_data.tool_calls)
+        for group_result in group_results:
+            for index, response in group_result:
+                responses[index] = response
 
         # Process tool responses and update multi_modal_data
         # Removed: agent_data.new_images_this_turn = []
