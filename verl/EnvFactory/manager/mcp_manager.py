@@ -35,15 +35,6 @@ class MCPManager:
             self.server_to_path_mapping: Dict[str, str] = {}
             self.tools: Dict[str, dict] = {}
 
-            # Serializes get-or-create + connect per client_id, now that the Ray actor runs
-            # with max_concurrency > 1 (see main_ppo.py) and concurrent calls can interleave
-            # between `is_connected()` and `_connect()`.
-            # NOTE: defensive. Removing the lock did NOT leak a subprocess in a 32-way
-            # same-client_id test -- fastmcp tolerates the concurrent _connect. Kept because
-            # it costs nothing and pins the invariant of one server process per client_id
-            # rather than relying on that fastmcp internal.
-            self.client_locks: Dict[str, asyncio.Lock] = {}
-
             # Loop management
             self.loop = asyncio.new_event_loop()
             self.loop_thread = threading.Thread(target=self.start_loop, daemon=True)
@@ -139,29 +130,13 @@ class MCPManager:
         """Execute tool with proper session handling."""
         name = tool_name.split("-")[-1]
         args = json.loads(tool_args) if isinstance(tool_args, str) else tool_args
+        client, loaded = self.get_client(client_id)
+        if "load_scenario" == name and loaded:
+            return "Already loaded scenario, skipping load."
 
-        # Hold the per-client lock across get_client + connect + tool execution to ensure:
-        # 1. Concurrent calls for the same client_id share one subprocess (no race on spawn)
-        # 2. Tool calls to the same stateful server execute serially (no state race)
-        # This only serializes calls with the SAME client_id; cross-rollout parallelism is
-        # unaffected (different rollouts use different client_ids via unique request_id).
-        lock = self.client_locks.setdefault(client_id, asyncio.Lock())
-        async with lock:
-            client, loaded = self.get_client(client_id)
-            if "load_scenario" == name and loaded:
-                return "Already loaded scenario, skipping load."
-
-            if not client.is_connected():
-                await client._connect()
-
-            # Execute tool call inside the lock to prevent concurrent modifications
-            # to the same stateful MCP server's internal state (counters, dicts, etc.)
-            result = await client.call_tool(name, args)
-
-            # Update loaded flag after successful load_scenario execution
-            if name == "load_scenario" and client_id in self.clients:
-                self.clients[client_id]["loaded"] = True
-
+        if not client.is_connected():
+            await client._connect()
+        result = await client.call_tool(name, args)
         return ",".join(item.text for item in result.content if hasattr(item, "text"))
 
     def call_tool(self, client_id: str, tool_name: str, tool_args: dict | str):
@@ -178,9 +153,6 @@ class MCPManager:
             return f"The {tool_name} error: {exc}."
 
     async def _close_client_async(self, client_id: str):
-        # client_ids are per-rollout and never reused, so drop the lock with the client to
-        # keep this dict from growing without bound over a long run.
-        self.client_locks.pop(client_id, None)
         client_info = self.clients.pop(client_id, None)
         if client_info and client_info["client"].is_connected():
             try:
@@ -232,7 +204,6 @@ class MCPManager:
     async def _close_all_clients_async(self):
         clients = [info["client"] for info in self.clients.values()]
         self.clients.clear()
-        self.client_locks.clear()
 
         await asyncio.gather(
             *(c.close() for c in clients),
