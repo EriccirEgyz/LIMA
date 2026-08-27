@@ -2,8 +2,8 @@
 # Convert verl FSDP checkpoint to HuggingFace format for evaluation
 set -e
 
-CKPT_DIR=${1:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60"}
-OUTPUT_DIR=${2:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60_hf"}
+CKPT_DIR=${1:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_110"}
+OUTPUT_DIR=${2:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_110_hf"}
 
 # Detect base model from config
 HF_MODEL_CONFIG=$(cat "$CKPT_DIR/actor/huggingface/config.json")

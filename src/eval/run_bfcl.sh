@@ -62,9 +62,20 @@ BFCL_DIR="$GORILLA_DIR/berkeley-function-call-leaderboard"
 # Qwen3-1.7B finetune would overwrite the same files. Setting BFCL_PROJECT_ROOT
 # relocates BFCL's whole result/ + score/ tree under a per-checkpoint dir; both
 # generate and evaluate derive their paths from it, so no per-command flags.
-# Override the location with BFCL_RUN_ROOT=...
+#
+# Without a further split, re-running is dangerous: when a result_*.json already
+# exists and --allow-overwrite isn't passed, BFCL's collect_test_cases()
+# (_llm_response_generation.py) loads the EXISTING results and only generates
+# responses for missing test ids -- it does not know or care that you changed
+# temperature, dtype, TP, or the sglang version, so a re-run can silently keep
+# grading stale responses. Rather than encode every one of those knobs into the
+# path (easy to miss one), follow the same fix used in run_tau2_bench.sh: give
+# each invocation its own timestamped run dir, so there's never a pre-existing
+# result file to accidentally reuse. Override with BFCL_RUN_ROOT=... (e.g. to
+# intentionally resume/extend a specific prior run).
 CKPT_NAME=$(basename "$MODEL")                       # e.g. EnvFactory-1.7B
-BFCL_RUN_ROOT=${BFCL_RUN_ROOT:-"$REPO_ROOT/results/bfcl/$CKPT_NAME"}
+RUN_TAG=${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
+BFCL_RUN_ROOT=${BFCL_RUN_ROOT:-"$REPO_ROOT/results/bfcl/$CKPT_NAME/$RUN_TAG"}
 export BFCL_PROJECT_ROOT="$BFCL_RUN_ROOT"
 MODEL_DIR_ESCAPED=${BFCL_MODEL_NAME//\//_}           # Qwen/Qwen3-1.7B-FC → Qwen_Qwen3-1.7B-FC
 
@@ -93,6 +104,7 @@ echo " Weights:        $MODEL"
 echo " BFCL name:      $BFCL_MODEL_NAME  (handler reused)"
 echo " Categories:     $CATEGORY"
 echo " SGLang Port:    $SGLANG_PORT"
+echo " Run tag:        $RUN_TAG"
 echo " Output root:    $BFCL_RUN_ROOT"
 echo "=============================================="
 

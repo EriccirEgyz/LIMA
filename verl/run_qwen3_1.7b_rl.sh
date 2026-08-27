@@ -137,6 +137,7 @@ ppo_max_token_len_per_gpu=147456
 # anyway -- but that inheritance is invisible when reading this script. Both lines below use
 # the same shell variable, so there is still exactly one number to edit.
 log_prob_max_token_len_per_gpu=589824 # (24x(max_prompt_length + max_response_length))  
+# 589824 (24x(max_prompt_length + max_response_length)) 两卡大致占用55GB
 # 491520 (20x(max_prompt_length + max_response_length)) 两卡大致占用45GB
 # 196608 (8x(max_prompt_length + max_response_length)) 两卡大致占用30GB以内
 

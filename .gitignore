@@ -29,6 +29,15 @@ __pycache__/
 /src/eval/gorilla/
 /src/eval/tau2-bench/
 
+# OmniaBench official harness — clean clone, re-clone via:
+#   git clone git@github.com:scuuy/OmniaBench.git
+# (its .venv and any local patches stay out of this repo)
+/OmniaBench/
+
+# Backup / one-off patch files (keep in working tree, not in history)
+*.bak-*
+*.fixA-*
+
 # LLaMA-Factory & verl ARE committed as source (modified for this repro),
 # but their weights / generated data / run artifacts are excluded:
 LLaMA-Factory/models/

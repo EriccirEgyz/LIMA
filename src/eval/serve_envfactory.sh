@@ -66,7 +66,7 @@ python -m sglang.launch_server \
   --port $PORT \
   --tp-size $TP \
   --dtype $DTYPE \
-  --mem-fraction-static 0.7 \
+  --mem-fraction-static 0.9 \
   --trust-remote-code \
   --reasoning-parser qwen3 \
   --tool-call-parser hermes
