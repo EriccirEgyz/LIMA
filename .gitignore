@@ -29,10 +29,10 @@ __pycache__/
 /src/eval/gorilla/
 /src/eval/tau2-bench/
 
-# OmniaBench official harness — clean clone, re-clone via:
-#   git clone git@github.com:scuuy/OmniaBench.git
-# (its .venv and any local patches stay out of this repo)
-/OmniaBench/
+# OmniaBench IS committed as source (modified for this repro):
+#   - deepseek thinking 控制 patch(agent开/user关/judge关,3处注入,2026-08-27)
+#   - 上游基线: github.com/scuuy/OmniaBench @ 6f91930(其 .git 已移除,更新需手动 diff)
+# 其 .venv / __pycache__ 由下方全局规则排除
 
 # Backup / one-off patch files (keep in working tree, not in history)
 *.bak-*

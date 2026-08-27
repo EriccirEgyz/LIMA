@@ -9,13 +9,19 @@
 #
 # 用法:
 #   export AGENT_API_KEY=sk-xxx        # yibuapi key(必填)
+#   ./src/traj/rollout_spbench.sh --mode verify  # 1 条快速验证(三态 think 检查等)
 #   ./src/traj/rollout_spbench.sh --mode smoke   # 3 条冒烟
 #   ./src/traj/rollout_spbench.sh --mode full    # 全量 1102 条
 #
 # 可选覆盖:
-#   MODEL=deepseek-v4-pro       agent + user 模拟器同款(负责人指定,不开 think)
+#   MODEL=deepseek-v4-pro       agent + user 模拟器同款(负责人指定)
 #   JUDGE_MODEL=xxx             rubric judge,默认与 MODEL 同款
-# 注:thinking 默认关 — 不传 --enable-thinking 即 False(agent/user/judge 三处都是)
+# 注:三态思考控制(负责人要求:agent 开,user/rubric 关)
+#   agent : --enable-thinking 显式开(yibuapi 默认也开,显式传防中转改默认后静默翻车)
+#   user/judge : --thinking-config 显式关。harness 原本对 deepseek 不传思考参数 =
+#               走中转默认 = 全开(2026-08-27 实测 user/judge 偷偷 think 已坐实),
+#               已在 agent_llm_inference.py + user_llm_inference.py 打 patch:
+#               deepseek 模型注入 thinking 参数(enabled/disabled)
 # ============================================================
 set -euo pipefail
 
@@ -36,6 +42,11 @@ LIMA=/workspace/shenchengyu/yizhigao/LIMA
 EVAL=$LIMA/OmniaBench/evaluation
 
 case "$MODE" in
+  verify)
+    GLOBAL_ID_RANGE="1-1"
+    WORKERS=1
+    OUT=$LIMA/data/trajectories/spbench_v1/smoke
+    ;;
   smoke)
     GLOBAL_ID_RANGE="1-3"
     WORKERS=3
@@ -46,17 +57,20 @@ case "$MODE" in
     WORKERS=16
     OUT=$LIMA/data/trajectories/spbench_v1/full
     ;;
-  *) echo "MODE 必须是 smoke|full"; exit 1;;
+  *) echo "MODE 必须是 verify|smoke|full"; exit 1;;
 esac
 mkdir -p "$OUT" "$LIMA/logs/spbench_v1"
 
 # yibuapi 在美国,必须走本地 mihomo(同 tau2 经验),否则连接劣化
 export http_proxy=http://127.0.0.1:7896 https_proxy=http://127.0.0.1:7896
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy
-export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=$no_proxy
+export no_proxy=localhost,127.0.0.1,::1
+export NO_PROXY=localhost,127.0.0.1,::1
 
 cd "$EVAL"
 source .venv/bin/activate
+# 关键:python 输出接 pipe 后是 8KB 全缓冲,不设这个进度条会"假卡住"看不到
+export PYTHONUNBUFFERED=1
 
 LOG=$LIMA/logs/spbench_v1/rollout_${MODE}_$(date +%Y%m%d_%H%M%S).log
 echo "=== spbench trajectory rollout mode=$MODE model=$MODEL range=$GLOBAL_ID_RANGE → $OUT ==="
@@ -70,7 +84,7 @@ echo "=== spbench trajectory rollout mode=$MODE model=$MODEL range=$GLOBAL_ID_RA
 #   spbench=多轮 DAG 任务 + 目的是采 SFT 轨迹 → conversation_sft
 python scripts/run_eval.py \
   --env-name omniabench_conversation_sft \
-  --task-items-path "$LIMA/data/raw/spbench_v1_0.json" \
+  --task-items-path "$LIMA/data/raw/spbench_v1_0_prepared.json" \
   --global-id-range "$GLOBAL_ID_RANGE" \
   --agent-model "$MODEL" --agent-provider openai \
   --agent-api-key "$AGENT_API_KEY" --agent-base-url "$BASE_URL" \
@@ -80,5 +94,7 @@ python scripts/run_eval.py \
   --rubric-judge-api-key "$AGENT_API_KEY" --rubric-judge-base-url "$BASE_URL" \
   --lang-filter all --prompt-lang auto \
   --max-task-workers "$WORKERS" \
+  --enable-thinking \
+  --thinking-config '{"user_enable_thinking": false, "rubric_judge_enable_thinking": false}' \
   --out-dir "$OUT" \
   2>&1 | tee "$LOG"
