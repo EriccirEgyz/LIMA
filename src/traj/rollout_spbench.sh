@@ -26,9 +26,11 @@
 set -euo pipefail
 
 MODE="smoke"
+RESUME=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --mode) MODE="$2"; shift 2;;
+    --resume) RESUME=1; shift;;
     *) echo "Unknown arg: $1"; exit 1;;
   esac
 done
@@ -97,4 +99,5 @@ python scripts/run_eval.py \
   --enable-thinking \
   --thinking-config '{"user_enable_thinking": false, "rubric_judge_enable_thinking": false}' \
   --out-dir "$OUT" \
+  $( [[ "$RESUME" == 1 ]] && echo --resume ) \
   2>&1 | tee "$LOG"
