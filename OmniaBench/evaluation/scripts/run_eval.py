@@ -541,7 +541,10 @@ def _is_resume_completed_result(item, retry_failed=True):
 
     默认 retry_failed=True：
     - result_status == failed 的样本不会被跳过，会进入 pending_runs 重新跑；
-    - termination_reason == INFRA_ERROR 的样本不会被跳过，会进入 pending_runs 重新跑。
+    - termination_reason == INFRA_ERROR 的样本不会被跳过，会进入 pending_runs 重新跑；
+    - termination_reason == TIMEOUT 的样本无差别重跑：既有 quota 耗尽/网络故障把
+      重试 sleep 拖满 wall-clock 的 infra 情形（result_status 仍是 completed），
+      也有任务本身超长的情形；截断轨迹对 SFT 采集无价值，统一靠 resume 兜底重跑。
 
     如果命令行传 --resume-keep-failed，则 retry_failed=False，失败样本也会被视为已完成。
     """
@@ -551,7 +554,8 @@ def _is_resume_completed_result(item, retry_failed=True):
     if retry_failed:
         if str(item.get("result_status", "")).strip().lower() == "failed":
             return False
-        if str(item.get("termination_reason", "")).strip().upper() == "INFRA_ERROR":
+        termination_reason = str(item.get("termination_reason", "")).strip().upper()
+        if termination_reason in ("INFRA_ERROR", "TIMEOUT"):
             return False
 
     return True
@@ -1440,7 +1444,8 @@ def main():
                     if retry_failed:
                         status = str(result.get("result_status", "")).strip().lower()
                         termination = str(result.get("termination_reason", "")).strip().upper()
-                        if status == "failed" or termination == "INFRA_ERROR":
+                        # TIMEOUT 与 INFRA_ERROR 一样重跑（原因见 _is_resume_completed_result）
+                        if status == "failed" or termination in ("INFRA_ERROR", "TIMEOUT"):
                             # 失败任务，不加入 completed，会重跑；同时清除之前该 key 可能存在的旧完成记录
                             result_by_run_key.pop((task_index, sample_idx), None)
                             completed_run_keys.discard((task_index, sample_idx))
