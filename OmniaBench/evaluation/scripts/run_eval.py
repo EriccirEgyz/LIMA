@@ -1382,8 +1382,18 @@ def main():
         # 从分片文件加载（使用 glob 遍历所有 shard）
         try:
             # 提取 base_name 用于匹配（移除时间戳）
+            # pass_k>1 时 stem 结尾是 `_passk{k}`（时间戳被顶到中间，pass_k=1 的正则
+            # 剥不到），需剥 `_时间戳_passk{k}` 整段；且 glob 模式中段要带 `_passk{k}`
+            # （`{prefix}*_passk{k}_incremental_shards`，星号吃掉目录名里的时间戳），
+            # 这样任意历史时间戳的同 pass_k 分片目录都能被 resume 捞回（与 pass_k=1
+            # 行为对齐），也不会误认其他 pass_k 的分片目录。
             import re
-            base_name = re.sub(r'_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$', '', output_file_stem)
+            if int(args.pass_k) > 1:
+                base_name = re.sub(r'_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}_passk\d+$', '', output_file_stem)
+                shard_dir_suffix = f"*_passk{int(args.pass_k)}_incremental_shards"
+            else:
+                base_name = re.sub(r'_\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}$', '', output_file_stem)
+                shard_dir_suffix = "*_incremental_shards"
 
             # 分片目录的父目录必须与本次创建 incremental_dir 时使用的父目录一致
             # （若指定了 --incremental-dir，历史分片目录也位于该目录下，而不是 runs_jsonl_path 的父目录）
@@ -1392,7 +1402,7 @@ def main():
             # 查找所有匹配的分片目录（不同时间戳的历史运行都可能包含互补的已完成结果）。
             # 注意：不排除本次的 incremental_dir 本身——它可能是刚新建的空目录（merge 无害），
             # 也可能是复用了已有历史时间戳的非空目录（此时必须保留，否则会丢数据）。
-            shard_dir_pattern = str(shard_dir_parent / f"{base_name}*_incremental_shards")
+            shard_dir_pattern = str(shard_dir_parent / f"{base_name}{shard_dir_suffix}")
             matching_shard_dirs = glob_module.glob(shard_dir_pattern)
 
             if matching_shard_dirs:
