@@ -16,6 +16,13 @@
 # 可选覆盖:
 #   MODEL=deepseek-v4-pro       agent + user 模拟器同款(负责人指定)
 #   JUDGE_MODEL=xxx             rubric judge,默认与 MODEL 同款
+#   PASS_K=7                    每 task 采样次数(默认 1)。>1 时产物文件名/分片目录带
+#                               _passk{N} 后缀,与 pass_k=1 的产物天然隔离;resume 只在
+#                               同 pass_k 内捞历史分片(跨 pass_k 不互认)。与 pass_k=1
+#                               的产物合并抽取时,两批 sample_idx 都从 1 编号,需先把
+#                               一批重编号(如 +N)再合并,否则同 key 后写覆盖会丢样本
+#   OUT_NAME=full_pass7         覆盖保存目录最后一级名(默认 verify/smoke→smoke,
+#                               full→full)。如 passk7 想与 pass_k=1 分目录存放时用
 # 注:三态思考控制(负责人要求:agent 开,user/rubric 关)
 #   agent : --enable-thinking 显式开(yibuapi 默认也开,显式传防中转改默认后静默翻车)
 #   user/judge : --thinking-config 显式关。harness 原本对 deepseek 不传思考参数 =
@@ -39,6 +46,8 @@ AGENT_API_KEY="${AGENT_API_KEY:?ERROR: 先 export AGENT_API_KEY=sk-xxx (yibuapi 
 BASE_URL="https://yibuapi.com/v1"
 MODEL="${MODEL:-deepseek-v4-pro}"
 JUDGE_MODEL="${JUDGE_MODEL:-$MODEL}"
+PASS_K="${PASS_K:-1}"
+OUT_NAME="${OUT_NAME:-}"
 
 LIMA=/workspace/shenchengyu/yizhigao/LIMA
 EVAL=$LIMA/OmniaBench/evaluation
@@ -61,6 +70,10 @@ case "$MODE" in
     ;;
   *) echo "MODE 必须是 verify|smoke|full"; exit 1;;
 esac
+# OUT 最后一级目录名可用 OUT_NAME 覆盖(默认按 mode 取 smoke/full)
+if [[ -n "$OUT_NAME" ]]; then
+  OUT="$LIMA/data/trajectories/spbench_v1/$OUT_NAME"
+fi
 mkdir -p "$OUT" "$LIMA/logs/spbench_v1"
 
 # yibuapi 在美国,必须走本地 mihomo(同 tau2 经验),否则连接劣化
@@ -96,6 +109,7 @@ python scripts/run_eval.py \
   --rubric-judge-api-key "$AGENT_API_KEY" --rubric-judge-base-url "$BASE_URL" \
   --lang-filter all --prompt-lang auto \
   --max-task-workers "$WORKERS" \
+  --pass-k "$PASS_K" \
   --enable-thinking \
   --thinking-config '{"user_enable_thinking": false, "rubric_judge_enable_thinking": false}' \
   --out-dir "$OUT" \
