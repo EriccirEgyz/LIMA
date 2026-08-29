@@ -1,0 +1,95 @@
+### ============================================================
+### spbench_v1 SFT — 与 EnvFactory 基线对照（Less-is-More 实验 1）
+### 基线: llamafactory_runs/qwen3-1.7b_full/sft.yaml (env_factory_sft)
+### 训练配方与基线逐字对齐，仅改 dataset + 为适配数据长度/仓库自含
+### 所做的必要偏离（全部列在下表，供对照实验报告引用）:
+###
+###   | 参数                       | 基线值        | 本配置       | 原因                          |
+###   |---------------------------|--------------|-------------|-------------------------------|
+###   | dataset                   | env_factory_sft | spbench_sft | 实验变量本身                  |
+###   | cutoff_len                | 16384        | 32768       | spbench 全长 p50=18994/p90=30847; 32768=Qwen3-1.7B 官方上限。超长处理(2026-08-29 读码+tokenize缓存实测纠正): 非 packing 下 LLaMA-Factory 不丢样本——mask_history 倒序装填, 最后一轮(loss区+EOS)完整, 截掉最老历史; 32768 实测 100% 保留, 1896 条(7.15%)截历史; 若用 16384 则 59% 样本的上下文被砍(终轮回复引用的早期工具结果丢失)。旧注"整条丢63.8%"系误述(源自 rollout_to_sft.py 旧打印) |
+###   | gradient_checkpointing    | 无           | true        | 16K 无 ckpt ~47G(H100 80G), 32K 激活翻倍必须开; 代价: 慢 ~30-40% |
+###   | model_name_or_path        | envfactory_repro/models/Qwen3-1.7B | LIMA/models/Qwen3-1.7B | 同一份权重, 改用 LIMA 仓库自有拷贝使其自含可复现 |
+###   | output_dir                | models/qwen3-1.7b/env_factory_sft | models/qwen3-1.7b/spbench_sft | 与基线配对命名 |
+###   | preprocessing_num_workers | 1            | 16          | 仅预处理并行, 不改任何训练语义; ~2.3万条 × 32K token 单进程 tokenize 需数小时 |
+###   | enable_liger_kernel       | 无           | true        | fused CE 分块计算消灭 18.55G fp32 logits 峰值(32K×151936词表×4B); 数学等价仅换内核, 使共享GPU(空余~58G)可跑 |
+###   其余参数（template/mask_history/batch/lr/epochs/调度器/bf16/ZeRO-3/保存策略）与基线逐字相同。
+###
+### 前置条件（训练前必须完成）:
+###   1. rollout 全量跑完后重新生成数据集(幂等):
+###      cd /workspace/shenchengyu/yizhigao/LIMA && \
+###      /workspace/shenchengyu/miniconda3/envs/envfactory-sft/bin/python \
+###        src/traj/rollout_to_sft.py --input data/trajectories/spbench_v1/full \
+###        --out data/sft/spbench_v1/spbench_sft.json --min-score 1.0 \
+###        --tokenizer models/Qwen3-1.7B
+###   2. 注册数据集(仿 env_factory_sft):
+###      ln -sfn /workspace/shenchengyu/yizhigao/LIMA/data/sft/spbench_v1/spbench_sft.json \
+###        LLaMA-Factory/data/spbench_sft.json
+###      并在 LLaMA-Factory/data/dataset_info.json 增加:
+###        "spbench_sft": {"file_name": "spbench_sft.json", "formatting": "alpaca",
+###          "columns": {"prompt": "instruction", "query": "input", "response": "output",
+###                      "history": "history", "system": "system"}}
+###
+### 运行（单卡；同基线: deepspped ZeRO-3 需先激活 conda env + FORCE_TORCHRUN=1）:
+###   source /workspace/shenchengyu/miniconda3/etc/profile.d/conda.sh && conda activate envfactory-sft
+###   cd /workspace/shenchengyu/yizhigao/LIMA/LLaMA-Factory
+###   FORCE_TORCHRUN=1 CUDA_VISIBLE_DEVICES=<空闲卡idx> CUDA_HOME=$CONDA_PREFIX \
+###     HF_HOME=/workspace/shenchengyu/hf-home TMPDIR=/workspace/shenchengyu/tmp \
+###     llamafactory-cli train llamafactory_runs/qwen3-1.7b_full/spbench_sft.yaml
+###   日志: mkdir -p /workspace/shenchengyu/yizhigao/LIMA/logs/spbench_v1 && \
+###     上述命令 2>&1 | tee /workspace/shenchengyu/yizhigao/LIMA/logs/spbench_v1/sft_$(date +%Y%m%d_%H%M%S).log
+###
+### 看训练曲线（远程访问需 ssh -L 6006:localhost:6006 转发）:
+###   conda activate envfactory-sft && tensorboard --logdir models/qwen3-1.7b/spbench_sft --port 6006
+###
+### 显存预估: 1.7B 全参 ZeRO-3 + 32K 序列 + 梯度检查点, H100 80G 余量充足
+### （若未来关检查点试速, 先盯着 nvidia-smi, 32K 激活无 ckpt 大概率 OOM）
+### ============================================================
+
+### model
+model_name_or_path: /workspace/shenchengyu/yizhigao/LIMA/models/Qwen3-1.7B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json   # 相对 LLaMA-Factory 根目录
+
+### dataset
+dataset: spbench_sft
+dataset_dir: data                # 相对 LLaMA-Factory 根目录
+template: qwen3
+mask_history: true               # history 不计入 loss（论文同）
+cutoff_len: 32768                # 必要偏离: 见头部 diff 表; = Qwen3-1.7B 官方上下文上限
+max_samples: 1000000             # 论文同（= 全量）
+overwrite_cache: true
+preprocessing_num_workers: 16    # 偏离基线(1): 仅加速 tokenize, 不改训练语义
+dataloader_num_workers: 1        # 论文同
+
+### 激活内存优化（必要偏离: 32K 序列激活翻倍, 16K 无 ckpt 已 ~47G）
+# gradient checkpointing会额外耗时30%-40%，显存足够时可以关闭
+#gradient_checkpointing: true
+#gradient_checkpointing_kwargs:
+#  use_reentrant: false           # ZeRO-3 兼容写法（同 examples/train_full 官方示例）
+enable_liger_kernel: true        # fused linear CE: 不物化 32K×151936 的 fp32 logits(~18.6G), 数学等价, 见头部 diff 表
+
+### output（与基线策略一致）
+output_dir: models/qwen3-1.7b/spbench_sft
+logging_steps: 10                # 论文同
+save_steps: 13                   
+plot_loss: true                  # 论文同
+overwrite_output_dir: false      # 断点续跑必须 false（同基线注释: true 会跳过自动 resume 重头训）
+save_only_model: false           # 论文同（存完整训练状态，可断点续训）
+report_to: tensorboard           # 论文同
+save_strategy: steps             
+
+### train（对齐论文/基线）
+per_device_train_batch_size: 1   # 论文同
+gradient_accumulation_steps: 256 # 单卡 effective batch=256（= 原文 8卡×1×32）
+learning_rate: 1.0e-6            # 论文同
+num_train_epochs: 3              # 论文同
+lr_scheduler_type: cosine        # 论文同
+warmup_ratio: 0.1                # 论文同
+bf16: true                       # 论文同
+ddp_timeout: 180000000           # 论文同（单卡无害）

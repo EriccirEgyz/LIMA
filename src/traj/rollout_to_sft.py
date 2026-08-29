@@ -393,7 +393,8 @@ def main():
             print(f"[4] token 统计({os.path.basename(args.tokenizer)}): p50={percentile(lengths, 0.5)} "
                   f"p90={percentile(lengths, 0.9)} p99={percentile(lengths, 0.99)} max={lengths[-1]}")
             print(f"    超过 cutoff_len={args.max_tokens} 的样本: {over} ({100 * over / len(lengths):.1f}%) "
-                  f"—— LLaMA-Factory 预处理时会整条丢弃这些样本")
+                  f"—— 非 packing 下 LLaMA-Factory 不丢样本: mask_history 倒序装填, "
+                  f"最后一轮(loss区)完整保留, 截掉最老历史(supervised.py encoded_pairs[::-1])")
         except ImportError:
             print("[4] 未装 transformers, 跳过 token 统计")
     else:
