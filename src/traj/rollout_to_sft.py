@@ -25,6 +25,8 @@
 #     --out data/sft/spbench_v1/spbench_sft.json \
 #     --min-score 1.0 \
 #     --tokenizer models/Qwen3-1.7B --max-tokens 16384
+#   终止语义已默认兼容两类 env:COMPLETED(conv_sft) + USER_STOP(非轮 RL env)
+#   = 干净终止;dag_s 产物无需额外参数。
 #   加 --dry-run 只看统计不落盘。
 # ============================================================
 import argparse
@@ -301,11 +303,18 @@ def trajectory_to_samples(result, stats, with_think=True):
 
 # ---------------- 3. 筛选 ----------------
 
-def filter_result(result, min_score):
-    """返回 (keep, reason)。"""
+def filter_result(result, min_score, accept_termination=frozenset({"COMPLETED", "USER_STOP"})):
+    """返回 (keep, reason)。
+
+    accept_termination: 允许的 termination_reason 集合 = "干净终止"。
+    conv_sft env 干净终止落 COMPLETED(spbench 语义);非轮 RL env(base_env.py)
+    官方标记是 USER_STOP —— 两者等价,默认都收。其余值(INFRA_ERROR/TIMEOUT/
+    MAX_TURNS/TOO_MUCH_TOOL_ERRORS/MODEL_OUTPUT_ERROR)一律拒。
+    已实证对存量无影响:spbench_v1 全量 1102 条里 USER_STOP 出现 0 次。
+    """
     if result.get("result_status") != "completed":
         return False, f"status={result.get('result_status')}"
-    if result.get("termination_reason") != "COMPLETED":
+    if result.get("termination_reason") not in accept_termination:
         return False, f"termination={result.get('termination_reason')}"
     if result.get("truncated"):
         return False, "truncated"
@@ -340,6 +349,10 @@ def main():
                     help="rollout 输出父目录(自动合并所有 *_incremental_shards) / 单个分片目录 / .runs.jsonl / 最终 .json")
     ap.add_argument("--out", default="data/sft/spbench_v1/spbench_sft.json", help="输出 alpaca json 路径")
     ap.add_argument("--min-score", type=float, default=1.0, help="rubric avg_result 阈值(默认 1.0=满分)")
+    ap.add_argument("--accept-termination", default="COMPLETED,USER_STOP",
+                    help="允许的 termination_reason 集合,逗号分隔。默认两值并集=干净终止"
+                         "(conv_sft 落 COMPLETED,非轮 RL env 落 USER_STOP,已实证存量 spbench 0 条 USER_STOP);"
+                         "INFRA_ERROR/TIMEOUT/MAX_TURNS 等一律拒")
     ap.add_argument("--global-ids-file", default=None,
                     help="任务名单 json, 只保留名单内的 task(join 键 = task_info.global_id); 缺省不过滤")
     ap.add_argument("--no-think", action="store_true", help="output 不拼教师 <think>(默认拼, 对齐基线)")
@@ -352,6 +365,9 @@ def main():
 
     t0 = time.time()
     stats = Counter()
+    accept_termination = frozenset(
+        s.strip().upper() for s in args.accept_termination.split(",") if s.strip()
+    ) or frozenset({"COMPLETED"})
     records = collect_records(args.input, stats)
     print(f"[1] 合并读取: {len(records)} 条唯一轨迹 (来源 {len(stats['sources'])} 个, 去重丢弃 {stats['dedup_drops']} 行, 坏行 {stats['bad_lines']})")
     for s in stats["sources"]:
@@ -380,7 +396,7 @@ def main():
         global_id = info.get("global_id", ti)
         avg = (result.get("rubric_eval") or {}).get("avg_result")
         env_total[env_id] += 1
-        keep, reason = filter_result(result, args.min_score)
+        keep, reason = filter_result(result, args.min_score, accept_termination)
         n_samples = 0
         if keep:
             traj_samples = trajectory_to_samples(result, stats, with_think=not args.no_think)
@@ -400,7 +416,8 @@ def main():
                          "lang": info.get("lang"), "avg_result": avg, "kept": keep,
                          "reason": reason, "n_samples": n_samples})
 
-    print(f"[2] 筛选(min_score={args.min_score}): 保留 {kept_trajs}/{len(records)} 条轨迹")
+    print(f"[2] 筛选(min_score={args.min_score}, accept_termination={sorted(accept_termination)}): "
+          f"保留 {kept_trajs}/{len(records)} 条轨迹")
     for r, c in reject_reasons.most_common():
         print(f"    剔除 {r}*: {c}")
     print(f"[3] 逐轮切片: {len(samples)} 个样本 (均值 {len(samples) / max(1, kept_trajs):.1f} 样本/轨迹)")
