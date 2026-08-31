@@ -767,5 +767,16 @@
       "history": "history",
       "system": "system"
     }
+  },
+  "spbench_route1_sft": {
+    "file_name": "spbench_route1_sft.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "history": "history",
+      "system": "system"
+    }
   }
 }

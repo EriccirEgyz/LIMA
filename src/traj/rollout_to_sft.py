@@ -9,6 +9,8 @@
 #      resume 的 result_by_run_key 语义。也支持直接传 .runs.jsonl / 最终 .json。
 #      注意: 官方结束时 _merge_incremental_files 只合并本次 run 的分片目录,
 #      产出的 .runs.jsonl 会缺 resume 之前的记录, 别用它当全量。
+#      可选 --global-ids-file 只转换名单内的 task(如 route1 354 名单,
+#      由 src/select/select_route1.py 生成), join 键 = task_info.global_id。
 #   2. 筛选: result_status=completed + termination_reason=COMPLETED +
 #      rubric_eval.avg_result >= min-score + judge parse_success。
 #   3. 展开为 alpaca 逐轮切片: 一条轨迹 → 每个 assistant 轮一个样本
@@ -135,6 +137,25 @@ def collect_records(input_path, stats):
     stats["sources"] = [str(d) for d in dirs]
     stats["dedup_drops"] = total_lines - len(merged)
     return merged
+
+
+def _load_global_ids(path):
+    """读任务名单 → set[global_id]。兼容: [1,2] / [{"global_id":1},...] / {"tasks":[...]} / {"global_ids":[...]}"""
+    payload = json.load(open(path, encoding="utf-8"))
+    if isinstance(payload, dict):
+        for key in ("global_ids", "tasks", "task_ids"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+    gids = set()
+    for item in payload if isinstance(payload, list) else []:
+        if isinstance(item, dict) and item.get("global_id") is not None:
+            gids.add(int(item["global_id"]))
+        elif isinstance(item, int):
+            gids.add(item)
+    if not gids:
+        sys.exit(f"[X] 名单 {path} 里没解析到任何 global_id")
+    return gids
 
 
 # ---------------- 2. 单条轨迹 → alpaca 样本 ----------------
@@ -319,6 +340,8 @@ def main():
                     help="rollout 输出父目录(自动合并所有 *_incremental_shards) / 单个分片目录 / .runs.jsonl / 最终 .json")
     ap.add_argument("--out", default="data/sft/spbench_v1/spbench_sft.json", help="输出 alpaca json 路径")
     ap.add_argument("--min-score", type=float, default=1.0, help="rubric avg_result 阈值(默认 1.0=满分)")
+    ap.add_argument("--global-ids-file", default=None,
+                    help="任务名单 json, 只保留名单内的 task(join 键 = task_info.global_id); 缺省不过滤")
     ap.add_argument("--no-think", action="store_true", help="output 不拼教师 <think>(默认拼, 对齐基线)")
     ap.add_argument("--tokenizer", default=None, help="tokenizer 路径, 用于精确 token 统计(缺省则跳过)")
     ap.add_argument("--max-tokens", type=int, default=16384,
@@ -333,6 +356,16 @@ def main():
     print(f"[1] 合并读取: {len(records)} 条唯一轨迹 (来源 {len(stats['sources'])} 个, 去重丢弃 {stats['dedup_drops']} 行, 坏行 {stats['bad_lines']})")
     for s in stats["sources"]:
         print(f"    - {s}")
+
+    if args.global_ids_file:
+        gids = _load_global_ids(args.global_ids_file)
+        hit = {int((r.get("task_info") or {}).get("global_id")) for r in records.values()
+               if (r.get("task_info") or {}).get("global_id") is not None}
+        records = {(ti, si): r for (ti, si), r in records.items()
+                   if (r.get("task_info") or {}).get("global_id") is not None
+                   and int(r["task_info"]["global_id"]) in gids}
+        print(f"[1b] task 过滤 {args.global_ids_file}: 名单 {len(gids)}, 命中有记录 {len(hit)}, "
+              f"名单内无记录 {len(gids - hit)}, 保留记录 {len(records)}")
 
     manifest = []
     samples = []
