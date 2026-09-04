@@ -28,13 +28,18 @@ MODEL=${MODEL:-"LARK-Lab/EnvFactory-1.7B"}
 PORT=${PORT:-8000}
 GPU_IDS=${GPU_IDS:-"0,1"}
 TP=${TP:-2}
-# Default float32 (NOT bf16): SFT-1.7B in bf16 spuriously emits an extra '}' at the
-# end of tool_call JSON ("}}}" instead of "}}"). sglang's hermes tool-call parser
-# then fails -> tau2 sees an empty AssistantMessage -> retail tasks die first turn
-# with "AssistantMessage must have either content or tool_calls". Same weights are
-# clean under float32 (greedy stays on the right side of the }} vs <|im_end|> logit
-# boundary). ~2x slower/VRAM, fine for 1.7B on H100. mem-fraction-static stays 0.9;
-# if float32 OOMs, lower it manually.
+# Dtype history — do NOT re-diagnose tool_call JSON corruption ("}}}", None/True
+# literals, truncation) as a bf16 precision problem. That theory was tried in
+# Aug 2026 (serve float32 as a "fix") and turned out to be a MISDIAGNOSIS: the
+# real cause was the transformers 5.8.0 config version skew — 5.x nests
+# rope_theta under rope_parameters and drops the top-level key, so sglang
+# silently fell back to rope_theta=10000 (100x too small) and generation
+# degenerated in longer contexts. The actual fix is at the model dir:
+# prepare_init.py writes a merged config with BOTH spellings. Serve only
+# prepare_init-built dirs (models/*/, never raw LLaMA-Factory checkpoints).
+# bf16 is the correct default again; DTYPE=float32 stays available as an
+# override for controlled precision experiments (~2x VRAM/speed, fine for 1.7B
+# on H100). See prepare_init.py's header for the measured repro.
 DTYPE=${DTYPE:-bfloat16}
 
 export CUDA_VISIBLE_DEVICES=$GPU_IDS
@@ -66,7 +71,7 @@ python -m sglang.launch_server \
   --port $PORT \
   --tp-size $TP \
   --dtype $DTYPE \
-  --mem-fraction-static 0.9 \
+  --mem-fraction-static 0.7 \
   --trust-remote-code \
   --reasoning-parser qwen3 \
   --tool-call-parser hermes

@@ -22,10 +22,14 @@
 #   1. bash src/eval/setup_bfcl.sh
 #   2. bash src/eval/serve_envfactory.sh  (wait until server is ready)
 #
-# Usage:
-#   bash src/eval/run_bfcl.sh                                  # single_turn + multi_turn (paper)
+# Usage (all knobs are env vars; the script self-logs under logs/<experiment>/,
+# so a launch command only needs MODEL and the port — no LOG= / output-path
+# bookkeeping at the call site, which is how stale pre-rename paths crept in):
+#   MODEL=$REPO/models/spbench/qwen3-1.7b-sft-ep1 SGLANG_PORT=8002 \
+#     nohup bash src/eval/run_bfcl.sh >/dev/null 2>&1 &
 #   bash src/eval/run_bfcl.sh --category multi_turn           # multi-turn only
 #   bash src/eval/run_bfcl.sh --category all                  # everything (v3-wide)
+#   EXPERIMENT=spbench_v1 MODEL=$REPO/models/spbench/...      # override grouping
 
 set -e
 
@@ -36,7 +40,7 @@ REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
 # MODEL = local weights dir (used for --local-model-path so the tokenizer loads
 #         offline and the request's model field matches sglang's served name).
 # BFCL_MODEL_NAME = the registered BFCL name whose handler we reuse.
-MODEL=${MODEL:-"$REPO_ROOT/models/EnvFactory-1.7B"}
+MODEL=${MODEL:-"$REPO_ROOT/models/envfactory_baseline/EnvFactory-1.7B"}
 BFCL_MODEL_NAME=${BFCL_MODEL_NAME:-"Qwen/Qwen3-1.7B-FC"}
 CATEGORY=${CATEGORY:-"single_turn,multi_turn"}
 SGLANG_PORT=${SGLANG_PORT:-8000}
@@ -75,9 +79,24 @@ BFCL_DIR="$GORILLA_DIR/berkeley-function-call-leaderboard"
 # intentionally resume/extend a specific prior run).
 CKPT_NAME=$(basename "$MODEL")                       # e.g. EnvFactory-1.7B
 RUN_TAG=${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
-BFCL_RUN_ROOT=${BFCL_RUN_ROOT:-"$REPO_ROOT/results/bfcl/$CKPT_NAME/$RUN_TAG"}
+# Experiment grouping keeps the layout contract (one name threads through
+# models/data/results/logs): results land in results/<experiment>/bfcl/... and
+# logs in logs/<experiment>/. Default experiment = the model's group dir
+# (models/<experiment>/<ckpt>); override with EXPERIMENT=... when the checkpoint
+# is filed under a coarser dir than its data (e.g. models/spbench/ trained on
+# data/sft/spbench_v1/ -> pass EXPERIMENT=spbench_v1).
+EXPERIMENT=${EXPERIMENT:-$(basename "$(dirname "$MODEL")")}
+BFCL_RUN_ROOT=${BFCL_RUN_ROOT:-"$REPO_ROOT/results/$EXPERIMENT/bfcl/$CKPT_NAME/$RUN_TAG"}
 export BFCL_PROJECT_ROOT="$BFCL_RUN_ROOT"
 MODEL_DIR_ESCAPED=${BFCL_MODEL_NAME//\//_}           # Qwen/Qwen3-1.7B-FC → Qwen_Qwen3-1.7B-FC
+
+# Self-log under logs/<experiment>/ with the SAME RUN_TAG as the run dir, so the
+# log file and results dir always pair up. stdout still passes through (tee),
+# so interactive runs and nohup >/dev/null both behave. Override with BFCL_LOG=.
+LOG_DIR="$REPO_ROOT/logs/$EXPERIMENT"
+mkdir -p "$BFCL_RUN_ROOT" "$LOG_DIR"
+BFCL_LOG=${BFCL_LOG:-"$LOG_DIR/bfcl_${CKPT_NAME}_${RUN_TAG}.log"}
+exec > >(tee -a "$BFCL_LOG") 2>&1
 
 # === Validate ===
 if [ ! -d "$BFCL_DIR/.venv" ]; then
@@ -98,14 +117,16 @@ if ! curl -s "http://localhost:$SGLANG_PORT/v1/models" > /dev/null 2>&1; then
 fi
 
 echo "=============================================="
-echo " BFCL v3 Evaluation: EnvFactory-1.7B"
+echo " BFCL v3 Evaluation"
 echo "=============================================="
 echo " Weights:        $MODEL"
 echo " BFCL name:      $BFCL_MODEL_NAME  (handler reused)"
+echo " Experiment:     $EXPERIMENT"
 echo " Categories:     $CATEGORY"
 echo " SGLang Port:    $SGLANG_PORT"
 echo " Run tag:        $RUN_TAG"
 echo " Output root:    $BFCL_RUN_ROOT"
+echo " Log:            $BFCL_LOG"
 echo "=============================================="
 
 cd "$BFCL_DIR"

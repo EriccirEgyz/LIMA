@@ -35,6 +35,11 @@
 # 可选覆盖:
 #   MODEL=deepseek-v4-pro       教师 agent(负责人指定)
 #   JUDGE_MODEL=xxx             rubric judge,默认与 MODEL 同款
+#   TEMPERATURE=0.0             agent 采样温度,默认 0.0 = 官方评测协议
+#                               (论文 §4.1 "Temperature is set to 0 whenever
+#                               supported")。⚠️ 2026-09-01 首轮 full 用的是
+#                               harness 默认 0.5,pass@1 仅 20% vs 官方 DSV4-Pro
+#                               DAG-S 63.5%,温度方差是头号嫌疑 —— 后续跑全用 0
 #   PASS_K=7                    每 task 采样次数(默认 1)。>1 时产物带 _passk{N}
 #                               后缀,与 pass_k=1 天然隔离;resume 只在同 pass_k
 #                               内捞历史分片。与 pass_k=1 产物合并时注意 sample_idx

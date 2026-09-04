@@ -2,8 +2,8 @@
 # Convert verl FSDP checkpoint to HuggingFace format for evaluation
 set -e
 
-CKPT_DIR=${1:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60"}
-OUTPUT_DIR=${2:-"/workspace/shenchengyu/yizhigao/envfactory_repro/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60_hf"}
+CKPT_DIR=${1:-"/workspace/shenchengyu/yizhigao/LIMA/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60"}
+OUTPUT_DIR=${2:-"/workspace/shenchengyu/yizhigao/LIMA/verl/checkpoints/EnvFactory/EnvFactory-RL-0818/global_step_60_hf"}
 
 # Detect base model from config
 HF_MODEL_CONFIG=$(cat "$CKPT_DIR/actor/huggingface/config.json")
@@ -12,7 +12,7 @@ echo "=== Converting FSDP checkpoint to HuggingFace format ==="
 echo "Source: $CKPT_DIR/actor"
 echo "Target: $OUTPUT_DIR"
 
-cd /workspace/shenchengyu/yizhigao/envfactory_repro/verl
+cd /workspace/shenchengyu/yizhigao/LIMA/verl
 
 # Activate the conda environment for RL
 source /workspace/shenchengyu/miniconda3/etc/profile.d/conda.sh
