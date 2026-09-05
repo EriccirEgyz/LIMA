@@ -21,7 +21,11 @@
 #
 # Prerequisites:
 #   1. bash src/eval/setup_tau2_bench.sh
-#   2. bash src/eval/serve_envfactory.sh  (wait until server is ready)
+#   2. bash src/eval/serve_envfactory.sh  (wait until server is ready) -- launch
+#      it with the SAME MODEL you pass here: this script never loads weights, so
+#      MODEL is only the label sent to the server (sglang ignores the request's
+#      model field) plus the bookkeeping key for results/logs. What actually gets
+#      evaluated is whatever the server loaded.
 #   3. Set environment variables for the user simulator (and, by default, the
 #      evaluator -- the paper uses DeepSeek-V3.2-Chat for BOTH):
 #        export USER_API_KEY="sk-xxx"
@@ -31,16 +35,30 @@
 #      model/endpoint, set EVAL_MODEL / EVAL_BASE_URL / EVAL_API_KEY (below) or
 #      pass --eval-model / --eval-base-url / --eval-api-key.
 #
-# Usage:
-#   bash src/eval/run_tau2_bench.sh [--domain retail] [--num-trials 1]
-#   bash src/eval/run_tau2_bench.sh --all   # run all 3 domains
+# Usage (all knobs are env vars; the script self-logs under logs/<experiment>/,
+# so a launch command only needs USER_* , MODEL, and the port -- no LOG= /
+# output-path bookkeeping at the call site, which is how stale pre-rename paths
+# crept in):
+#   USER_BASE_URL=... USER_API_KEY=... \
+#     MODEL=$REPO/models/spbench/qwen3-1.7b-sft-ep1 SGLANG_PORT=8002 \
+#     nohup bash src/eval/run_tau2_bench.sh >/dev/null 2>&1 &
+#   bash src/eval/run_tau2_bench.sh --domain retail    # single domain
+#   EXPERIMENT=spbench_v1 MODEL=$REPO/models/spbench/...   # override grouping
 
 set -e
 
+EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
+TAU2_DIR="$EVAL_DIR/tau2-bench"
+
 # === Agent model (local SGLang) ===
+# MODEL = local weights dir, used ONLY for bookkeeping (experiment/ckpt name
+#         inference + the agent label). AGENT_MODEL = the name sent in requests;
+#         defaults to the checkpoint basename.
 SGLANG_PORT=${SGLANG_PORT:-8000}
 SGLANG_API_KEY=${SGLANG_API_KEY:-"placeholder"}
-AGENT_MODEL=${AGENT_MODEL:-"LARK-Lab/EnvFactory-1.7B"}
+MODEL=${MODEL:-"$REPO_ROOT/models/envfactory_baseline/EnvFactory-1.7B"}
+AGENT_MODEL=${AGENT_MODEL:-"$(basename "$MODEL")"}
 AGENT_BASE_URL=${AGENT_BASE_URL:-"http://localhost:${SGLANG_PORT}/v1"}
 
 # === User simulator (third-party OpenAI-compatible) ===
@@ -64,7 +82,7 @@ DOMAIN=""
 RUN_ALL=""
 NUM_TRIALS=${NUM_TRIALS:-1}
 MAX_CONCURRENCY=${MAX_CONCURRENCY:-3}
-TEMPERATURE=0.7
+TEMPERATURE=${TEMPERATURE:-0.7}
 
 # === Parse args ===
 while [[ $# -gt 0 ]]; do
@@ -72,6 +90,7 @@ while [[ $# -gt 0 ]]; do
         --domain) DOMAIN="$2"; RUN_ALL=false; shift 2;;
         --num-trials) NUM_TRIALS="$2"; shift 2;;
         --port) SGLANG_PORT="$2"; AGENT_BASE_URL="http://localhost:${SGLANG_PORT}/v1"; shift 2;;
+        --model) MODEL="$2"; AGENT_MODEL="$(basename "$MODEL")"; shift 2;;
         --agent-model) AGENT_MODEL="$2"; shift 2;;
         --user-model) USER_MODEL="$2"; shift 2;;
         --eval-model) EVAL_MODEL="$2"; shift 2;;
@@ -103,24 +122,50 @@ export TAU2_EVAL_API_KEY="$EVAL_API_KEY"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-$EVAL_API_KEY}"
 export OPENAI_API_BASE="${OPENAI_API_BASE:-$USER_BASE_URL}"
 
-EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
-TAU2_DIR="$EVAL_DIR/tau2-bench"
-
 # Redirect tau2's output into our results tree instead of burying it inside the
 # vendored tau2-bench checkout (where it'd be lost on re-clone). tau2 uses one
 # DATA_DIR for both input (tau2/domains/...) and output (simulations/), so we
-# point TAU2_DATA_DIR at a per-checkpoint dir and symlink the input data in.
-# Override the location with TAU2_RUN_ROOT=...
-RESULTS_TAG=${RESULTS_TAG:-$(basename "$AGENT_MODEL")}
-TAU2_RUN_ROOT=${TAU2_RUN_ROOT:-"$REPO_ROOT/results/tau2/$RESULTS_TAG"}
+# point TAU2_DATA_DIR at a per-checkpoint dir and symlink the input data in
+# (relatively, so the tree survives repo relocation -- absolute links died in
+# the envfactory_repro -> LIMA move). Unlike BFCL, no per-invocation timestamp
+# subdir is needed: tau2 never reuses prior outputs (every run writes a fresh
+# timestamped simulations/<domain>_<RUN_TAG>/ dir), so simulations accumulate
+# per checkpoint and old runs stay comparable.
+#
+# Experiment grouping keeps the layout contract (one name threads through
+# models/data/results/logs): results land in results/<experiment>/tau2/... and
+# logs in logs/<experiment>/. Default experiment = the model's group dir
+# (models/<experiment>/<ckpt>); override with EXPERIMENT=... when the checkpoint
+# is filed under a coarser dir than its data (e.g. models/spbench/ trained on
+# data/sft/spbench_v1/ -> pass EXPERIMENT=spbench_v1).
+CKPT_NAME=$(basename "$MODEL")                       # e.g. EnvFactory-1.7B
+RUN_TAG=${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}
+EXPERIMENT=${EXPERIMENT:-$(basename "$(dirname "$MODEL")")}
+TAU2_RUN_ROOT=${TAU2_RUN_ROOT:-"$REPO_ROOT/results/$EXPERIMENT/tau2/$CKPT_NAME"}
 export TAU2_DATA_DIR="$TAU2_RUN_ROOT"
 mkdir -p "$TAU2_DATA_DIR"
-ln -sfn "$TAU2_DIR/data/tau2" "$TAU2_DATA_DIR/tau2"   # input data via symlink
+ln -sfn "$(realpath --relative-to="$TAU2_DATA_DIR" "$TAU2_DIR/data/tau2")" \
+    "$TAU2_DATA_DIR/tau2"   # input data via (relative) symlink
+
+# Self-log under logs/<experiment>/ with the SAME RUN_TAG as the simulation
+# save names, so the log file and its simulations/ dirs always pair up. stdout
+# still passes through (tee), so interactive runs and nohup >/dev/null both
+# behave. Override with TAU2_LOG=.
+LOG_DIR="$REPO_ROOT/logs/$EXPERIMENT"
+mkdir -p "$LOG_DIR"
+TAU2_LOG=${TAU2_LOG:-"$LOG_DIR/tau2_${CKPT_NAME}_${RUN_TAG}.log"}
+exec > >(tee -a "$TAU2_LOG") 2>&1
 
 # === Validate ===
 if [ ! -d "$TAU2_DIR" ]; then
     echo "ERROR: tau2-bench not found. Run: bash src/eval/setup_tau2_bench.sh"
+    exit 1
+fi
+
+if [ ! -d "$MODEL" ]; then
+    echo "ERROR: weights dir not found: $MODEL"
+    echo "Pass MODEL=/path/to/checkpoint (and serve it with the same path via"
+    echo "serve_envfactory.sh)."
     exit 1
 fi
 
@@ -137,15 +182,15 @@ else
     DOMAINS=("$DOMAIN")
 fi
 
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-
 # === Build litellm args JSON ===
 AGENT_LLM_ARGS="{\"api_base\": \"$AGENT_BASE_URL\", \"api_key\": \"$SGLANG_API_KEY\", \"temperature\": $TEMPERATURE}"
 USER_LLM_ARGS="{\"api_base\": \"$USER_BASE_URL\", \"api_key\": \"$USER_API_KEY\"}"
 
 echo "=============================================="
-echo " tau2-bench Evaluation: EnvFactory-1.7B"
+echo " tau2-bench Evaluation"
 echo "=============================================="
+echo " Weights:        $MODEL"
+echo " Experiment:     $EXPERIMENT"
 echo " Domains:        ${DOMAINS[*]}"
 echo " Num Trials:     $NUM_TRIALS"
 echo " Agent Model:    openai/$AGENT_MODEL ($AGENT_BASE_URL)"
@@ -153,6 +198,9 @@ echo " User Model:     openai/$USER_MODEL ($USER_BASE_URL)"
 echo " Evaluator:      openai/$EVAL_MODEL ($EVAL_BASE_URL)"
 echo " Temperature:    $TEMPERATURE"
 echo " Concurrency:    $MAX_CONCURRENCY"
+echo " Run tag:        $RUN_TAG"
+echo " Results root:   $TAU2_RUN_ROOT"
+echo " Log:            $TAU2_LOG"
 echo "=============================================="
 
 cd "$TAU2_DIR"
@@ -161,7 +209,7 @@ for d in "${DOMAINS[@]}"; do
     echo ""
     echo ">>> Running domain: $d"
 
-    SAVE_NAME="${d}_${TIMESTAMP}"
+    SAVE_NAME="${d}_${RUN_TAG}"
 
     # Run via tau2_eval_patch.py (not bare `tau2`) so the NL-assertions judge is
     # redirected to $EVAL_BASE_URL; it forwards all args to tau2's CLI main().
