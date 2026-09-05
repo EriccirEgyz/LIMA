@@ -1,0 +1,93 @@
+### ============================================================
+### spbench_v1 SFT @ Qwen3-8B — Less-is-More 实验 1 的 8B 版
+### 姊妹配置: llamafactory_runs/qwen3-1.7b_full/spbench_sft.yaml (1.7B 同数据)
+### 基线血统: 配方逐字源自 EnvFactory 论文 configs/llamafactory_sft.yaml
+###
+### 相对 1.7B spbench 配置的偏离（供对照实验报告引用）:
+###   | 参数                        | 1.7B 值                     | 本配置                        | 原因 |
+###   |----------------------------|-----------------------------|-------------------------------|------|
+###   | model_name_or_path          | models/Qwen3-1.7B           | models/Qwen3-8B               | 实验变量本身（规模对照） |
+###   | gradient_accumulation_steps | 256(单卡)                   | 32(八卡)                      | 8×1×32=256 保持 effective batch 不变 |
+###   | num_train_epochs            | 3(论文同)                   | 3(论文同)                     | 2026-09-05 曾议调 4, 终定 3（与论文/在跑 job 一致, 避免多余偏离） |
+###   | gradient_checkpointing      | true(后注释掉)              | 不写=自动开启                  | LF 源码默认 disable_gradient_checkpointing=False 自动开(在跑 job 日志可证); 8B@32K 无 ckpt 激活 ~140G 必 OOM; 代价 ~30% 已含在冒烟 7.2s 内 |
+###   | enable_liger_kernel         | true                        | true                          | 2026-09-05 起 gyz_sft 已装 liger-kernel 0.8.2; fused CE 免物化 32K×151936 logits |
+###   | flash_attn                  | 无                          | fa2                           | 2026-09-05 提速: flash-attn 2.8.3 wheel; 长序列 SDPA→FA2（冒烟实测单 token 算力 ~4×） |
+###   | deepspeed                   | ds_z3_config.json           | ds_z2_config.json(官方模板)   | 2026-09-05 提速: 8B@8×H200 显存充裕(~50G/卡), ZeRO-3 每 microstep 全参 all-gather 纯亏 |
+###   | save_strategy              | steps(13)                   | steps(52)                     | ~1/6 epoch 一存, 含优化器 ~114G/个 可断点续训 |
+###   其余参数（dataset/template/mask_history/cutoff/batch/lr/调度器/bf16）与 1.7B spbench 配置逐字相同。
+###
+### ⚡ 2026-09-05 12:30 提速重启（历史: 首轮 4卡+z3+SDPA 无liger 1081s/step, ETA 90h, 单卡 MFU~8%）:
+###   根因: ① 只用4卡(4-7 空闲未用) ② SDPA 长序列慢 ③ ZeRO-3 每 microstep 16G×2 参数 all-gather 且
+###   overlap_comm=false ④ 无 liger, 每 microstep 物化 32K×151936 logits。
+###   冒烟(GPU7): FA2+liger+ckpt 32K fwd+bwd 7.2s（34.4G 峰值）→ 算力侧 ~4×; 乘 8 卡 2×, 预期 150-300s/step。
+###   effective batch 256 / lr / 调度器 / epochs / 数据语义全部不变, 仅提速不改数学。
+###
+### 数据集前置（新机已就绪, 2026-09-04 迁移验活）:
+###   LLaMA-Factory/data/spbench_sft.json -> ../../data/sft/spbench_v1/spbench_sft.json (软链活)
+###   dataset_info.json 已注册 spbench_sft (alpaca 格式)。26534 条, cutoff 32768 实测 100% 保留。
+###
+### 运行（八卡 H200; deepspeed 必须先激活 conda env + FORCE_TORCHRUN=1）:
+###   source /mnt/beegfs/workspace/scy/activate_conda.sh && conda activate gyz_sft
+###   cd /mnt/beegfs/workspace/scy/yizhigao/LIMA/LLaMA-Factory
+###   FORCE_TORCHRUN=1 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 CUDA_HOME=$CONDA_PREFIX \
+###     llamafactory-cli train llamafactory_runs/qwen3-8b_full/spbench_sft.yaml \
+###     2>&1 | tee llamafactory_runs/qwen3-8b_full/spbench_sft_train_8gpu.log
+###
+### 看训练曲线（远程访问需 ssh -L 6006:localhost:6006 转发）:
+###   conda activate gyz_sft && tensorboard --logdir models/qwen3-8b/spbench_sft --port 6006
+###
+### ⚠️ 显存(2026-09-05 提速重启后): ZeRO-2 @ 8卡 = 参数16G(不分片) + 梯度分片2G + 优化器分片12G
+###   + grad-ckpt 激活(冒烟实测 32K 含模型+梯度峰值 34.4G) ≈ ~50G/卡, 非常安全。
+###   32K 无 ckpt 激活 ~130G+ 仍放不下单卡 141G, 故 ckpt 必须保持开。
+### ⚠️ 卡现状(2026-09-05 12:00): sglang pod 已撤, 0-7 八卡全空闲, 本轮用满。
+### ============================================================
+
+### model
+model_name_or_path: /mnt/beegfs/workspace/scy/yizhigao/LIMA/models/Qwen3-8B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json   # 官方模板(相对 LF 根, 同原 z3 用法); 2026-09-05 提速: 8B@8×H200 显存充裕, 不需要 z3 的逐 microstep 全参 all-gather
+flash_attn: fa2                  # 2026-09-05 提速: flash-attn 2.8.3 预编译 wheel (cu12torch2.8/cxx11abiTRUE/cp312); 长序列 SDPA→FA2
+enable_liger_kernel: true        # 2026-09-05 提速: fused linear CE 免物化 32K×151936 logits; 1.7B 同数据已验证数学等价
+
+### dataset
+dataset: spbench_sft
+dataset_dir: data                # 相对 LLaMA-Factory 根目录
+template: qwen3
+mask_history: true               # history 不计入 loss（论文同）
+cutoff_len: 32768                # spbench 全长 p50=18994/p90=30847; 32768=Qwen3 官方上限, 实测 100% 保留
+max_samples: 1000000             # = 全量 26534
+overwrite_cache: true
+preprocessing_num_workers: 16    # 仅预处理并行, 不改训练语义; 2.6万条 × 32K token 单进程 tokenize 需数小时
+dataloader_num_workers: 8        # 2026-09-05 提速: bs=1 时 worker 只 collate 单条样本, 8 卡各自独立 dataloader, 8 无压力
+
+### output
+output_dir: models/qwen3-8b/spbench_sft
+logging_steps: 10
+save_steps: 26
+plot_loss: true
+overwrite_output_dir: false      # 续跑必须 false: true 会跳过自动 resume 从头重训
+save_only_model: false           # 存完整训练状态可断点续训(~114G/ckpt × 4)
+report_to: tensorboard
+save_strategy: steps
+
+### train（对齐论文/基线, 偏离项见头部表）
+per_device_train_batch_size: 4
+gradient_accumulation_steps: 8  # 八卡 effective batch = 8×4×8 = 256（= 原文 8卡×1×32, 不变）
+learning_rate: 1.0e-6
+num_train_epochs: 3
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### gradient checkpointing（2026-09-05 实测验证）
+# 不显式设置 = LF 默认自动开启（disable_gradient_checkpointing=False）
+# 实测: 8B@32K 无 ckpt 激活峰值 ~172G（外推），超单卡 141G 必 OOM
+# 激活显存斜率: 4.75 G / 1K tokens（8K→24K 线性实测）
+# 开 ckpt 后: 32K 峰值 34.4G（冒烟实测），代价 ~30% 计算（重算激活）
+# 结论: ckpt 必须保持开启，这是 8B@32K 的硬约束，非可调优项
