@@ -75,6 +75,7 @@ BASE_URL="https://yibuapi.com/v1"
 MODEL="${MODEL:-deepseek-v4-pro}"
 JUDGE_MODEL="${JUDGE_MODEL:-$MODEL}"
 PASS_K="${PASS_K:-1}"
+TEMPERATURE="${TEMPERATURE:-0.5}"
 OUT_NAME="${OUT_NAME:-}"
 
 LIMA=/workspace/shenchengyu/yizhigao/LIMA
@@ -119,7 +120,7 @@ source .venv/bin/activate
 export PYTHONUNBUFFERED=1
 
 LOG=$LIMA/logs/dag_s/rollout_${MODE}_$(date +%Y%m%d_%H%M%S).log
-echo "=== dag_s(route4/DAG-S 单轮) trajectory rollout mode=$MODE model=$MODEL range=$GLOBAL_ID_RANGE → $OUT ==="
+echo "=== dag_s(route4/DAG-S 单轮) trajectory rollout mode=$MODE model=$MODEL temperature=$TEMPERATURE range=$GLOBAL_ID_RANGE → $OUT ==="
 python scripts/run_eval.py \
   --env-name omniabench_non_conversation_rl \
   --task-items-path "$TASKS" \
@@ -132,6 +133,7 @@ python scripts/run_eval.py \
   --lang-filter all --prompt-lang auto \
   --max-task-workers "$WORKERS" \
   --pass-k "$PASS_K" \
+  --temperature "$TEMPERATURE" \
   --enable-thinking \
   --thinking-config '{"rubric_judge_enable_thinking": false}' \
   --out-dir "$OUT" \

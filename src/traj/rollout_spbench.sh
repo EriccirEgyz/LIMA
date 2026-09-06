@@ -16,6 +16,7 @@
 # 可选覆盖:
 #   MODEL=deepseek-v4-pro       agent + user 模拟器同款(负责人指定)
 #   JUDGE_MODEL=xxx             rubric judge,默认与 MODEL 同款
+#   TEMPERATURE=0.5             agent 采样温度,默认 0.5(harness 默认值)
 #   PASS_K=7                    每 task 采样次数(默认 1)。>1 时产物文件名/分片目录带
 #                               _passk{N} 后缀,与 pass_k=1 的产物天然隔离;resume 只在
 #                               同 pass_k 内捞历史分片(跨 pass_k 不互认)。与 pass_k=1
@@ -47,6 +48,7 @@ BASE_URL="https://yibuapi.com/v1"
 MODEL="${MODEL:-deepseek-v4-pro}"
 JUDGE_MODEL="${JUDGE_MODEL:-$MODEL}"
 PASS_K="${PASS_K:-1}"
+TEMPERATURE="${TEMPERATURE:-0.5}"
 OUT_NAME="${OUT_NAME:-}"
 
 LIMA=/workspace/shenchengyu/yizhigao/LIMA
@@ -88,7 +90,7 @@ source .venv/bin/activate
 export PYTHONUNBUFFERED=1
 
 LOG=$LIMA/logs/spbench_v1/rollout_${MODE}_$(date +%Y%m%d_%H%M%S).log
-echo "=== spbench trajectory rollout mode=$MODE model=$MODEL range=$GLOBAL_ID_RANGE → $OUT ==="
+echo "=== spbench trajectory rollout mode=$MODE model=$MODEL temperature=$TEMPERATURE range=$GLOBAL_ID_RANGE → $OUT ==="
 # ---- env-name 选择(run_eval.py ENV_CLS_MAP,四个=两个维度的组合)----
 #   conversation_*     多轮对话:UserAgent 模拟用户(persona 驱动),用户发 ###STOP### 终止
 #   non_conversation_* 单轮多步:任务描述即开场,无用户模拟,agent 自报 "Task Completed/Failed" 终止
@@ -110,6 +112,7 @@ python scripts/run_eval.py \
   --lang-filter all --prompt-lang auto \
   --max-task-workers "$WORKERS" \
   --pass-k "$PASS_K" \
+  --temperature "$TEMPERATURE" \
   --enable-thinking \
   --thinking-config '{"user_enable_thinking": false, "rubric_judge_enable_thinking": false}' \
   --out-dir "$OUT" \
