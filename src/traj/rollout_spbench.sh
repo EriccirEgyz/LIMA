@@ -51,7 +51,8 @@ PASS_K="${PASS_K:-1}"
 TEMPERATURE="${TEMPERATURE:-0.5}"
 OUT_NAME="${OUT_NAME:-}"
 
-LIMA=/workspace/shenchengyu/yizhigao/LIMA
+#LIMA=/workspace/shenchengyu/yizhigao/LIMA
+LIMA=/mnt/beegfs/workspace/scy/yizhigao/LIMA
 EVAL=$LIMA/OmniaBench/evaluation
 
 case "$MODE" in

@@ -78,7 +78,8 @@ PASS_K="${PASS_K:-1}"
 TEMPERATURE="${TEMPERATURE:-0.5}"
 OUT_NAME="${OUT_NAME:-}"
 
-LIMA=/workspace/shenchengyu/yizhigao/LIMA
+#LIMA=/workspace/shenchengyu/yizhigao/LIMA
+LIMA=/mnt/beegfs/workspace/scy/yizhigao/LIMA
 EVAL=$LIMA/OmniaBench/evaluation
 TASKS=$EVAL/data/routes/route4.json   # 官方 HF 数据(scuuy666/OmniaBench),orchestrate/手动已下载
 
@@ -106,8 +107,6 @@ if [[ -n "$OUT_NAME" ]]; then
 fi
 mkdir -p "$OUT" "$LIMA/logs/dag_s"
 
-[[ -f "$TASKS" ]] || { echo "ERROR: 缺 $TASKS(orchestrate_eval 会自动下载,或手动 huggingface_hub.snapshot_download repo=scuuy666/OmniaBench repo_type=dataset allow_routes/*)"; exit 1; }
-
 # yibuapi 在美国,必须走本地 mihomo(同 tau2/spbench 经验)
 export http_proxy=http://127.0.0.1:7896 https_proxy=http://127.0.0.1:7896
 export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy
@@ -116,6 +115,27 @@ export NO_PROXY=localhost,127.0.0.1,::1
 
 cd "$EVAL"
 source .venv/bin/activate
+
+# 自动下载 OmniaBench 数据集(如果缺失)
+if [[ ! -f "$TASKS" ]]; then
+  echo "=== route4.json 不存在,自动从 HuggingFace 下载 OmniaBench 数据集 ==="
+  python -c "
+from huggingface_hub import snapshot_download
+import sys
+try:
+    snapshot_download(
+        repo_id='scuuy666/OmniaBench',
+        repo_type='dataset',
+        local_dir='$EVAL/data',
+        allow_patterns=['routes/*']
+    )
+    print('下载完成')
+except Exception as e:
+    print(f'下载失败: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+  [[ -f "$TASKS" ]] || { echo "ERROR: 下载后仍然缺 $TASKS"; exit 1; }
+fi
 # 关键:python 输出接 pipe 后是 8KB 全缓冲,不设这个进度条会"假卡住"看不到
 export PYTHONUNBUFFERED=1
 
