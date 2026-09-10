@@ -67,7 +67,7 @@ preprocessing_num_workers: 16    # 仅预处理并行, 不改训练语义; 2.6�
 dataloader_num_workers: 8        # 2026-09-05 提速: bs=1 时 worker 只 collate 单条样本, 8 卡各自独立 dataloader, 8 无压力
 
 ### output
-output_dir: models/qwen3-8b/spbench_sft
+output_dir: models/qwen3-8b/spbench_route1_sft
 logging_steps: 10
 save_steps: 26
 plot_loss: true
