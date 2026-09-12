@@ -46,20 +46,13 @@ export CUDA_VISIBLE_DEVICES=$GPU_IDS
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-# --- Workarounds for an incomplete container image (no root available) --------
-# Both of these should be deleted once the image ships libnuma1 and
-# cuda-nvcc-12-8 (`apt-get install -y libnuma1 cuda-nvcc-12-8`).
-#
-# 1. sgl_kernel's prebuilt .so links against libnuma.so.1, absent from this
-#    image. .venv/extra-lib holds a copy from conda-forge.
-export LD_LIBRARY_PATH="$REPO_ROOT/.venv/extra-lib:$LD_LIBRARY_PATH"
-#
-# 2. sglang 0.5.9 JIT-compiles its rope kernel at CUDA-graph capture time, so it
-#    needs nvcc. /usr/local/cuda here is runtime-only (no bin/), so we point
-#    CUDA_HOME at a CUDA 12.8 toolchain assembled from conda-forge packages
-#    (matching torch's cu128). ninja lives in .venv/bin and must be on PATH too.
-export CUDA_HOME="$REPO_ROOT/.venv/cuda-nvcc"
-export PATH="$CUDA_HOME/bin:$REPO_ROOT/.venv/bin:$PATH"
+# --- Activate gyz_serve conda environment (sglang 0.5.9 + deps) --------------
+# The setup_serve_env_h200.sh script builds this env with libnuma + cuda-nvcc
+# already inside, so no extra LD_LIBRARY_PATH / CUDA_HOME workarounds needed.
+# shellcheck disable=SC1091
+source /mnt/beegfs/workspace/scy/activate_conda.sh
+conda activate gyz_serve
+export CUDA_HOME="$CONDA_PREFIX"  # point sglang JIT at conda's nvcc
 # -----------------------------------------------------------------------------
 
 # 同卡上没有其它程序时，--mem-fraction-static可以设到0.9，有其它的话要降低一些，比如到0.7

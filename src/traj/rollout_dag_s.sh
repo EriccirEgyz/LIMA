@@ -96,7 +96,18 @@ case "$MODE" in
     ;;
   full)
     GLOBAL_ID_RANGE="3000000-3000221" # 22 个空洞 → 实选 200 条
-    WORKERS=16
+    # 2026-09-11 实测调优(依据: full_temp0 那轮 16 workers 的日志):
+    #   单任务耗时 sum=189538s / p50=839s / p90=1547s / max=3629s,墙钟 3h34m
+    #   → 有效并行度 14.7/16(92%),worker 基本打满,且全程 0 次 429/rate limit
+    #   → 瓶颈在"槽位不够"而非 API,提并发近线性收益
+    #   墙钟下界 = max(最长单任务, sum/WORKERS):
+    #     16→3.3h  32→1.65h  48→1.1h  52 以上被 max 单任务(≈1h)锁死,加了也白加
+    #   GIL 不是瓶颈:16 workers 时进程只吃 15% 单核(纯网络等待),48 时约 45%,仍有余量
+    #   取 32 为默认(相对实测无压力的 16 保守翻倍);想再快用 WORKERS=48 ./...,
+    #   超过 48 无意义。⚠️ 打过头不会报错,只会在 agent_llm_inference.py 的
+    #   time.sleep(retries*10) 里静默退避(max_retries=10 最坏单次调用睡 450s)
+    #   → 表现为"每条任务变慢"而不是"报 429",所以别凭感觉往上堆,看日志 took 有没有变长
+    WORKERS="${WORKERS:-32}"
     OUT=$LIMA/data/trajectories/dag_s/full
     ;;
   *) echo "MODE 必须是 verify|smoke|full"; exit 1;;
@@ -108,10 +119,10 @@ fi
 mkdir -p "$OUT" "$LIMA/logs/dag_s"
 
 # yibuapi 在美国,必须走本地 mihomo(同 tau2/spbench 经验)
-export http_proxy=http://127.0.0.1:7896 https_proxy=http://127.0.0.1:7896
-export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy
-export no_proxy=localhost,127.0.0.1,::1
-export NO_PROXY=localhost,127.0.0.1,::1
+#export http_proxy=http://127.0.0.1:7896 https_proxy=http://127.0.0.1:7896
+#export HTTP_PROXY=$http_proxy HTTPS_PROXY=$https_proxy
+#export no_proxy=localhost,127.0.0.1,::1
+#export NO_PROXY=localhost,127.0.0.1,::1
 
 cd "$EVAL"
 source .venv/bin/activate

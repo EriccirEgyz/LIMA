@@ -1,0 +1,137 @@
+# ============================================================
+### k8s Pod 版 spbench_route1 SFT @ Qwen3-8B(替代 nohup 直启)
+### 由来: 负责人要求改用 pod 跑训练。模板参照组内 kimi-serving sglang pod
+###   (hostPath 挂 BeeGFS / hostNetwork / 大 /dev/shm / nvidia.com/gpu: 8)。
+### 要点:
+###   - 定点 h200-11(nodeName): 只有这台归我们用
+###   - 镜像用 h200-11 上已预拉的 sglang cu12 底座, 仅当 Ubuntu 22.04 bash 环境用;
+###     真正的训练环境 = BeeGFS 上的 miniconda3/envs/gyz_sft(与直启时同一份,
+###     flash-attn/liger/torch 全在里面, 镜像里装了什么无所谓)
+###   - 原命令里的 nohup/setsid 不再需要: pod 本身就是常驻进程;
+###     CUDA_VISIBLE_DEVICES 也不用手动设: 申请 8 卡后 device plugin 自动注入
+###   - 日志双份: tee 落 BeeGFS(持久) + kubectl logs(实时)
+###
+### 启动:   kubectl apply -f job_dag_s_sft.yaml
+### 看日志: kubectl logs -f scy-qwen3-8b-dag-s-sft
+### 看状态: kubectl get pod scy-qwen3-8b-dag-s-sft -o wide
+### 排障:   kubectl describe pod scy-qwen3-8b-dag-s-sft
+### 停止:   kubectl delete pod scy-qwen3-8b-dag-s-sft
+### ============================================================
+apiVersion: v1
+kind: Pod
+metadata:
+  name: scy-qwen3-8b-dag-s-sft
+  namespace: default
+  labels:
+    app: llamafactory-sft
+    owner: scy
+spec:
+  runtimeClassName: nvidia-cdi         # 必需! 不设就走默认 runc, 没有任何 NVIDIA 注入钩子:
+                                       #   容器里既没有 nvidia-smi 也没有 libcuda.so.1,
+                                       #   torch.cuda.is_available() 直接 False。
+                                       # 注意: privileged:true 会把宿主机 /dev 整个透进来,
+                                       #   于是 /dev/nvidia0..7 看着都在 —— 那是假象,
+                                       #   光有设备节点没有驱动用户态库照样用不了卡。
+                                       # 同节点 h200-11 上能跑通的 GPU pod 用的也是 nvidia-cdi。
+  nodeName: h200-11                    # 只用 h200-11;直接定点,不经过调度器
+  restartPolicy: Never                 # 训练挂了不自动重启(防止从头重跑);用 checkpoint + resume 手动续训
+  hostNetwork: true                    # 同组内 sglang pod 模式: 直接用主机网络, NCCL 能看到 IB 网卡
+  dnsPolicy: ClusterFirstWithHostNet
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 300   # 留时间给 torchrun 收尾(写 checkpoint)
+  containers:
+  - name: sft
+    image: docker.io/lmsysorg/sglang:kimi-k3-cu12
+    imagePullPolicy: IfNotPresent      # 镜像已在 h200-11 本地, 不触发外网拉取
+    resources:
+      requests:                        # 与组内 sglang pod 相同量级
+        cpu: "64"
+        memory: 512Gi
+        nvidia.com/gpu: "8"
+      limits:
+        cpu: "160"
+        memory: 1800Gi
+        nvidia.com/gpu: "8"
+    workingDir: /mnt/beegfs/workspace/scy/yizhigao/LIMA/LLaMA-Factory
+    securityContext:
+      privileged: true                 # 组内 GPU pod 惯例; 免去 IPC_LOCK 等 capability 细节问题。
+                                       # 想连它一起去掉见文件末尾 "进一步收紧" 注释, 需单独冒烟。
+      #runAsUser: 1000                   # 非 root 跑。注意是 1000 而不是 1001:
+      #runAsGroup: 1000                  #   BeeGFS 上 LIMA/** 与已有 checkpoint 全是 1000:1000 且 755,
+      #runAsNonRoot: true                #   组位没有 w -> 以 1001 跑会写不进 output_dir / tee 日志。
+                                       #   1001 只拥有 HOME 层(workspace/scy 与 miniconda3),
+                                       #   而那层训练只需读, 所以对齐 1000 才是对的。
+                                       # GPU 与 uid 无关: /dev/nvidia* 是 crw-rw-rw-, CDI 注入照常。
+                                       # hostPath 卷不吃 fsGroup/supplementalGroups(只对支持
+                                       #   ownership management 的卷类型生效), 权限完全由
+                                       #   BeeGFS 上的属主/mode 决定 -> 只能靠对齐 uid 解决。
+                                       # runAsNonRoot: 万一 uid 被误改回 0, pod 直接拒绝启动而不是
+                                       #   悄悄用 root 跑一遍再留下一堆 root 属主的 checkpoint。
+    env:
+    - name: NVIDIA_VISIBLE_DEVICES
+      value: management.nvidia.com/gpu=all
+                                       # 必须写全限定 CDI 设备名, 否则光加 runtimeClassName 仍是 0 卡:
+                                       #   device plugin 走 envvar 策略, 注入的是裸 UUID
+                                       #   (NVIDIA_VISIBLE_DEVICES=GPU-2b1bc964-...);
+                                       #   裸名字会被拼上 runtime 的 default-kind
+                                       #   management.nvidia.com/gpu, 而 UUID 只存在于
+                                       #   k8s.device-plugin.nvidia.com/gpu 这个 kind 下 ->
+                                       #   kind 对不上, 解析失败, 什么都没注入, 容器却照样起来。
+                                       #   `nvidia-ctk cdi list` 可见本机只有这两个 kind。
+                                       # 提醒: =all 是暴露节点上全部 8 张卡, 不再受分配结果约束。
+                                       #   独占 8 卡时结果一致; 若改成申请 4 卡, 要换成按 UUID 的
+                                       #   k8s.device-plugin.nvidia.com/gpu=GPU-xxxx 全限定名。
+    - name: FORCE_TORCHRUN
+      value: "1"                       # 八卡必须, 与原命令一致
+    - name: PYTHONUNBUFFERED
+      value: "1"
+    - name: NCCL_DEBUG
+      value: WARN
+    - name: NCCL_SOCKET_IFNAME
+      value: ibp203s0                  # 同组内 sglang pod: 防止 NCCL 绑到 cni/flannel 虚拟网卡上
+    - name: GLOO_SOCKET_IFNAME
+      value: ibp203s0                  # deepspeed 的 gloo 后端同理
+    command:
+    - /bin/bash
+    - -c
+    - |
+      set -eo pipefail
+      source /mnt/beegfs/workspace/scy/activate_conda.sh   # 该脚本会设 HOME 到 BeeGFS, conda/pip 缓存不落容器
+      conda activate gyz_sft
+      cd /mnt/beegfs/workspace/scy/yizhigao/LIMA/LLaMA-Factory
+      export CUDA_HOME="$CONDA_PREFIX"
+      echo "=== GPU 注入检查 ==="
+      echo "NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES-<unset>}"
+      echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES-<unset>}"
+      env | grep -E '^(CUDA|NVIDIA)_' || true
+      ls -l /dev/nvidia* 2>&1 || true
+      grep -nE 'CUDA_VISIBLE_DEVICES|NVIDIA_VISIBLE_DEVICES' \
+        /mnt/beegfs/workspace/scy/activate_conda.sh || true
+      echo "=== 环境自检 ==="
+      if command -v nvidia-smi >/dev/null 2>&1; then
+        nvidia-smi --query-gpu=index,name,memory.total --format=csv
+      else
+        echo "WARNING: nvidia-smi is not installed in this image; checking GPU through PyTorch instead."
+      fi
+      python -c "import torch, flash_attn, liger_kernel; \
+      n=torch.cuda.device_count(); \
+      print('torch', torch.__version__, '| cuda', torch.version.cuda, '| gpus', n, '| fa2', flash_attn.__version__, '| liger ok'); \
+      assert torch.cuda.is_available(), 'CUDA is unavailable inside the Pod'; \
+      assert n == 8, f'Expected 8 GPUs, but found {n}'"
+      echo "=== 开始 SFT $(date) ==="
+      llamafactory-cli train llamafactory_runs/qwen3-8b_full/dag_s_sft.yaml \
+        2>&1 | tee llamafactory_runs/qwen3-8b_full/dag_s_sft_train_pod1.log
+    volumeMounts:
+    - name: beegfs
+      mountPath: /mnt/beegfs           # 挂到与宿主机相同路径, 配置里的绝对路径(model/Qwen3-8B 等)零改动
+    - name: shm
+      mountPath: /dev/shm              # NCCL 需要大共享内存, 默认 64MB 会挂
+  volumes:
+  - name: beegfs
+    hostPath:
+      path: /mnt/beegfs
+      type: Directory
+  - name: shm
+    emptyDir:
+      medium: Memory
+      sizeLimit: 64Gi
