@@ -36,6 +36,10 @@ set -e
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
 
+# Redirect caches out of the uid-1001 $HOME (permissions). See cache_env.sh.
+# shellcheck disable=SC1091
+source "$EVAL_DIR/cache_env.sh"
+
 # === Defaults (aligned with paper: the two reported columns) ===
 # MODEL = local weights dir (used for --local-model-path so the tokenizer loads
 #         offline and the request's model field matches sglang's served name).

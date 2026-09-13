@@ -44,12 +44,32 @@
 #     nohup bash src/eval/run_tau2_bench.sh >/dev/null 2>&1 &
 #   bash src/eval/run_tau2_bench.sh --domain retail    # single domain
 #   EXPERIMENT=spbench_v1 MODEL=$REPO/models/spbench/...   # override grouping
+#
+# RESUMING AN INTERRUPTED RUN
+# tau2 checkpoints every task into results.json as it finishes (not at the end),
+# and skips already-done (trial, task_id, seed) triples on resume. But the save
+# name is "<domain>_$RUN_TAG" and RUN_TAG defaults to `date`, so a plain re-run
+# starts a FRESH dir and re-pays for everything. To actually continue, pin
+# RUN_TAG to the interrupted run's tag (it is in that run's log name and its
+# results path):
+#   RUN_TAG=20260913_144553 USER_BASE_URL=... USER_API_KEY=... \
+#     MODEL=$REPO/models/.../checkpoint-192 SGLANG_PORT=8002 \
+#     bash src/eval/run_tau2_bench.sh --domain retail
+# --auto-resume is passed unconditionally below, so this works under nohup.
+# Prefer Ctrl+C (SIGINT) over kill -9 when stopping: tau2 traps it, cancels the
+# in-flight tasks and reports how many are checkpointed. kill -9 loses only the
+# tasks still running; everything already written stays valid.
 
 set -e
 
 EVAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$EVAL_DIR/../.." && pwd)"
 TAU2_DIR="$EVAL_DIR/tau2-bench"
+
+# Redirect caches out of the uid-1001 $HOME before any `uv run`, which otherwise
+# fails with "Failed to initialize cache at .../.cache/uv". See cache_env.sh.
+# shellcheck disable=SC1091
+source "$EVAL_DIR/cache_env.sh"
 
 # === Agent model (local SGLang) ===
 # MODEL = local weights dir, used ONLY for bookkeeping (experiment/ckpt name
@@ -209,6 +229,8 @@ for d in "${DOMAINS[@]}"; do
     echo ""
     echo ">>> Running domain: $d"
 
+    # Pin RUN_TAG (see "RESUMING AN INTERRUPTED RUN" above) to reuse an existing
+    # save dir and pick up where a killed run left off.
     SAVE_NAME="${d}_${RUN_TAG}"
 
     # Run via tau2_eval_patch.py (not bare `tau2`) so the NL-assertions judge is
@@ -222,7 +244,9 @@ for d in "${DOMAINS[@]}"; do
         --num-trials "$NUM_TRIALS" \
         --max-concurrency "$MAX_CONCURRENCY" \
         --seed 300 \
-        --save-to "$SAVE_NAME"
+        --save-to "$SAVE_NAME" \
+        --auto-resume   # no-op on a fresh save dir; required for non-interactive
+                        # resume (tau2 otherwise prompts y/n and hangs on nohup)
 
     echo ">>> Domain $d complete. Results saved to: $TAU2_DATA_DIR/simulations/$SAVE_NAME"
 done

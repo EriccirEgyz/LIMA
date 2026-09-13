@@ -53,7 +53,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 source /mnt/beegfs/workspace/scy/activate_conda.sh
 conda activate gyz_serve
 export CUDA_HOME="$CONDA_PREFIX"  # point sglang JIT at conda's nvcc
-# -----------------------------------------------------------------------------
+
+# Redirect caches out of the uid-1001 $HOME. Without this, sglang dies while
+# merely parsing args, on flashinfer's import-time JIT logger. See cache_env.sh.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/src/eval/cache_env.sh"
 
 # 同卡上没有其它程序时，--mem-fraction-static可以设到0.9，有其它的话要降低一些，比如到0.7
 
@@ -64,7 +68,7 @@ python -m sglang.launch_server \
   --port $PORT \
   --tp-size $TP \
   --dtype $DTYPE \
-  --mem-fraction-static 0.7 \
+  --mem-fraction-static 0.9 \
   --trust-remote-code \
   --reasoning-parser qwen3 \
   --tool-call-parser hermes
