@@ -1,0 +1,74 @@
+#!/bin/bash
+# Serve EnvFactory-1.7B with SGLang for tau2-bench evaluation
+#
+# Aligned with EnvFactory paper:
+#   - SGLang framework
+#   - reasoning-parser qwen3 (Qwen3 thinking model)
+#   - TP=1 sufficient for 1.7B; set TP=2 for larger models
+#   - context-length not explicitly set; defaults to the model's native
+#     max_position_embeddings (40960 for EnvFactory-1.7B). No YaRN/rope-scaling
+#     (config has rope_scaling=None), and none needed — tau2-bench conversations
+#     stay well under 40k. Override with --context-length only if you must go
+#     beyond 40960 (which would then require rope scaling).
+#
+# Usage: override any of MODEL / PORT / GPU_IDS / TP on the command line.
+#   ./serve_envfactory.sh                                  # defaults: 1.7B on GPU 0,1 with TP=2
+#   GPU_IDS=3 TP=1 ./serve_envfactory.sh                   # single GPU
+#   MODEL=models/EnvFactory-1.7B ./serve_envfactory.sh    # local weights, no network
+# Note: the number of GPUs in GPU_IDS must equal TP.
+#
+# MODEL takes either a HF repo id or a local directory. To pre-download via a
+# mirror (useful when huggingface.co is unreachable):
+#   HF_ENDPOINT=https://hf-mirror.com hf download LARK-Lab/EnvFactory-1.7B \
+#     --local-dir models/EnvFactory-1.7B
+
+set -e
+
+MODEL=${MODEL:-"LARK-Lab/EnvFactory-1.7B"}
+PORT=${PORT:-8000}
+GPU_IDS=${GPU_IDS:-"0,1"}
+TP=${TP:-2}
+# Dtype history — do NOT re-diagnose tool_call JSON corruption ("}}}", None/True
+# literals, truncation) as a bf16 precision problem. That theory was tried in
+# Aug 2026 (serve float32 as a "fix") and turned out to be a MISDIAGNOSIS: the
+# real cause was the transformers 5.8.0 config version skew — 5.x nests
+# rope_theta under rope_parameters and drops the top-level key, so sglang
+# silently fell back to rope_theta=10000 (100x too small) and generation
+# degenerated in longer contexts. The actual fix is at the model dir:
+# prepare_init.py writes a merged config with BOTH spellings. Serve only
+# prepare_init-built dirs (models/*/, never raw LLaMA-Factory checkpoints).
+# bf16 is the correct default again; DTYPE=float32 stays available as an
+# override for controlled precision experiments (~2x VRAM/speed, fine for 1.7B
+# on H100). See prepare_init.py's header for the measured repro.
+DTYPE=${DTYPE:-bfloat16}
+
+export CUDA_VISIBLE_DEVICES=$GPU_IDS
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
+# --- Activate gyz_serve conda environment (sglang 0.5.9 + deps) --------------
+# The setup_serve_env_h200.sh script builds this env with libnuma + cuda-nvcc
+# already inside, so no extra LD_LIBRARY_PATH / CUDA_HOME workarounds needed.
+# shellcheck disable=SC1091
+source /mnt/beegfs/workspace/scy/activate_conda.sh
+conda activate gyz_serve
+export CUDA_HOME="$CONDA_PREFIX"  # point sglang JIT at conda's nvcc
+
+# Redirect caches out of the uid-1001 $HOME. Without this, sglang dies while
+# merely parsing args, on flashinfer's import-time JIT logger. See cache_env.sh.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/src/eval/cache_env.sh"
+
+# 同卡上没有其它程序时，--mem-fraction-static可以设到0.9，有其它的话要降低一些，比如到0.7
+
+echo "=== Serving $MODEL on port $PORT (GPU: $GPU_IDS, TP=$TP) ==="
+
+python -m sglang.launch_server \
+  --model-path "$MODEL" \
+  --port $PORT \
+  --tp-size $TP \
+  --dtype $DTYPE \
+  --mem-fraction-static 0.9 \
+  --trust-remote-code \
+  --reasoning-parser qwen3 \
+  --tool-call-parser hermes
