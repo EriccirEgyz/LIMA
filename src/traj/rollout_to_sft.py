@@ -290,7 +290,11 @@ def trajectory_to_samples(result, stats, with_think=True):
             output = f"<think>{think}</think>\n\n{asst_text}"
         else:
             stats["turns_without_think"] += 1
-            output = asst_text
+            # 补空 <think></think> 保持格式一致，消除 think 泄漏风险
+            if with_think:
+                output = f"<think></think>\n\n{asst_text}"
+            else:
+                output = asst_text
         samples.append({
             "instruction": user_text,
             "input": "",
