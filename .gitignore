@@ -28,6 +28,7 @@ __pycache__/
 # Unmodified vendored eval clones — re-cloned by setup_*.sh (not committed)
 /src/eval/gorilla/
 /src/eval/tau2-bench/
+/src/eval/vitabench/
 
 # OmniaBench IS committed as source (modified for this repro):
 #   - deepseek thinking 控制 patch(agent开/user关/judge关,3处注入,2026-08-27)

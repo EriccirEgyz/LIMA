@@ -1,0 +1,34 @@
+# VitaBench model config TEMPLATE. No secrets here.
+#
+# $-brace placeholders are filled from environment variables by run_vitabench.sh,
+# which renders this file to a temp copy (mode 600, deleted on exit) and points
+# VITA_MODEL_CONFIG_PATH at it.
+#
+# How vita uses this file (vitabench/src/vita/utils/llm_utils.py):
+#   - base_url is POSTed to as-is, so it must be the full /chat/completions URL.
+#   - Every key of a model entry is merged into the request body, so values
+#     here (temperature, chat_template_kwargs, ...) are what gets sent.
+#   - "name" is sent as the request's "model" field.
+
+default:
+  headers:
+    Content-Type: "application/json"
+
+models:
+  # Agent under test, served locally by SGLang (serve_31_h100.sh).
+  - name: "${AGENT_MODEL}"
+    base_url: "${AGENT_BASE_URL}/chat/completions"
+    temperature: ${AGENT_TEMPERATURE}
+    # Qwen3 thinks by default under SGLang, and vita's --enable-think does not
+    # change that, so switch it via the chat template.
+    chat_template_kwargs:
+      enable_thinking: ${ENABLE_THINK}
+    headers:
+      Authorization: "Bearer ${AGENT_API_KEY}"
+
+  # User simulator + evaluator (EnvFactory: DeepSeek-V3.2-Chat).
+  - name: "${USER_MODEL}"
+    base_url: "${USER_BASE_URL}/chat/completions"
+    temperature: ${USER_TEMPERATURE}
+    headers:
+      Authorization: "Bearer ${USER_API_KEY}"
