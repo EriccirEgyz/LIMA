@@ -30,5 +30,9 @@ models:
   - name: "${USER_MODEL}"
     base_url: "${USER_BASE_URL}/chat/completions"
     temperature: ${USER_TEMPERATURE}
+    # Used by vita's get_response_cost; 0 for either price -> cost reported as 0.
+    cost_1m_token_dollar:
+      prompt_price: ${USER_PROMPT_PRICE}
+      completion_price: ${USER_COMPLETION_PRICE}
     headers:
       Authorization: "Bearer ${USER_API_KEY}"

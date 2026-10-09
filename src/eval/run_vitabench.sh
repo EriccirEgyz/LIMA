@@ -35,6 +35,9 @@
 #   # With thinking enabled and custom concurrency
 #   ENABLE_THINK=true MAX_CONCURRENCY=4 bash src/eval/run_vitabench.sh
 #
+#   # Track user simulator / evaluator cost ($ per 1M tokens)
+#   USER_PROMPT_PRICE=0.28 USER_COMPLETION_PRICE=0.42 bash src/eval/run_vitabench.sh
+#
 #   # Run specific tasks
 #   TASK_IDS=1,2,3 bash src/eval/run_vitabench.sh
 #
@@ -92,9 +95,19 @@ USER_BASE_URL=${USER_BASE_URL:?"ERROR: Set USER_BASE_URL (e.g. https://your-prov
 USER_API_KEY=${USER_API_KEY:?"ERROR: Set USER_API_KEY"}
 USER_TEMPERATURE=${USER_TEMPERATURE:-0}
 EVALUATOR_MODEL=${EVALUATOR_MODEL:-"$USER_MODEL"}
+# Pricing for the user simulator / evaluator, in dollars per 1M tokens. vita
+# reports cost only when both are non-zero; set either to 0 to disable.
+USER_PROMPT_PRICE=${USER_PROMPT_PRICE:-3.2}
+USER_COMPLETION_PRICE=${USER_COMPLETION_PRICE:-4.8}
+for v in USER_PROMPT_PRICE USER_COMPLETION_PRICE; do
+    if ! [[ "${!v}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "ERROR: $v must be a non-negative number, got '${!v}'"
+        exit 1
+    fi
+done
 
 # Evaluation parameters
-NUM_TRIALS=${NUM_TRIALS:4}
+NUM_TRIALS=${NUM_TRIALS:-4}
 NUM_TASKS=${NUM_TASKS:-}  # Empty = all tasks
 TASK_IDS=${TASK_IDS:-}    # Empty = all tasks, or comma-separated IDs: 1,2,3
 MAX_STEPS=${MAX_STEPS:-300}
@@ -143,7 +156,8 @@ chmod 600 "$VITA_MODEL_CONFIG_PATH"
 trap 'rm -f "$VITA_MODEL_CONFIG_PATH"' EXIT
 export VITA_MODEL_CONFIG_PATH
 export AGENT_MODEL AGENT_BASE_URL AGENT_API_KEY AGENT_TEMPERATURE ENABLE_THINK \
-       USER_MODEL USER_BASE_URL USER_API_KEY USER_TEMPERATURE
+       USER_MODEL USER_BASE_URL USER_API_KEY USER_TEMPERATURE \
+       USER_PROMPT_PRICE USER_COMPLETION_PRICE
 python3 - "$MODELS_TEMPLATE" "$VITA_MODEL_CONFIG_PATH" <<'EOF'
 import os, re, sys
 text = open(sys.argv[1]).read()
@@ -198,6 +212,7 @@ echo "Domains: ${DOMAINS[*]}"
 echo "Agent: $AGENT_MODEL ($AGENT_BASE_URL, temperature=$AGENT_TEMPERATURE)"
 echo "User: $USER_MODEL ($USER_BASE_URL, temperature=$USER_TEMPERATURE)"
 echo "Evaluator: $EVALUATOR_MODEL"
+echo "User/evaluator price (\$/1M tokens): prompt=$USER_PROMPT_PRICE completion=$USER_COMPLETION_PRICE"
 echo "Thinking: $ENABLE_THINK"
 echo "Max steps: $MAX_STEPS"
 echo "Concurrency: $MAX_CONCURRENCY"
