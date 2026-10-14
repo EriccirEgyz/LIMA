@@ -13,6 +13,8 @@
 #
 # Prerequisites:
 #   1. bash src/eval/setup_vitabench.sh
+#      Pins meituan-longcat/vitabench; its corrected tasks/tools differ from
+#      the historical meituan/vitabench@973756f evaluation protocol.
 #   2. Start the agent model server (e.g. bash src/eval/serve_31_h100.sh)
 #   3. export USER_BASE_URL=... USER_API_KEY=...  (user simulator / evaluator)
 #   Model endpoints come from vitabench_models.yaml, filled from env vars below.
@@ -111,7 +113,7 @@ NUM_TRIALS=${NUM_TRIALS:-4}
 NUM_TASKS=${NUM_TASKS:-}  # Empty = all tasks
 TASK_IDS=${TASK_IDS:-}    # Empty = all tasks, or comma-separated IDs: 1,2,3
 MAX_STEPS=${MAX_STEPS:-300}
-MAX_CONCURRENCY=${MAX_CONCURRENCY:-1}
+MAX_CONCURRENCY=${MAX_CONCURRENCY:-8}
 LANGUAGE=${LANGUAGE:-"chinese"}
 
 # === Output layout (same contract as run_bfcl.sh / run_tau2_bench.sh) ===
@@ -137,6 +139,9 @@ if [ ! -d "$VITABENCH_DIR" ]; then
     echo "Run: bash src/eval/setup_vitabench.sh"
     exit 1
 fi
+
+VITA_COMMIT=$(git -C "$VITABENCH_DIR" rev-parse HEAD)
+VITA_UPSTREAM=$(git -C "$VITABENCH_DIR" remote get-url origin)
 
 if [ ! -f "$MODELS_TEMPLATE" ]; then
     echo "ERROR: Model config template not found at $MODELS_TEMPLATE"
@@ -205,6 +210,8 @@ domain_stem() {
 
 # === Run evaluation ===
 echo "=== VitaBench Evaluation ==="
+echo "VitaBench upstream: $VITA_UPSTREAM"
+echo "VitaBench commit: $VITA_COMMIT"
 echo "Weights: $MODEL"
 echo "Experiment: $EXPERIMENT"
 echo "Run tag: $RUN_TAG"
