@@ -1,7 +1,8 @@
-"""LIMA's host-side Terminus 2 launcher; task execution stays in Modal."""
+"""LIMA's host-side Terminus 2 launcher; tasks run in local Docker by default."""
 
 import argparse
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatchcase
 import json
 import math
 import os
@@ -15,11 +16,66 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from harbor.agents.terminus_2.terminus_2 import Terminus2Options
+from harbor.environments.docker.docker import DockerEnvironment
 from harbor.models.job.config import JobConfig
 
 DATASET = "terminal-bench/terminal-bench"
 VERSION = "4.0.0"
 HARBOR = Path(sys.executable).parent / "harbor"
+DOCKER_IMPORT = "src.eval.terminalbench.run:LocalDockerEnvironment"
+GPU_TASKS = ("fp8-rmsnorm-gemm", "math-eval-grader", "jax-speedrun-gpu")
+
+
+class LocalDockerEnvironment(DockerEnvironment):
+    """Pin the task AND its separate verifier to the explicitly selected GPU.
+
+    Harbor clears agent-only Compose overlays for separate verifiers, but keeps
+    environment kwargs/import_path. Use those hooks rather than editing tasks.
+    Jobs using this single-GPU adapter must run serially to avoid contention.
+    """
+
+    def __init__(self, *args, gpu_device=None, **kwargs):
+        self.gpu_device = gpu_device
+        super().__init__(*args, **kwargs)
+        if self._effective_gpus > 0:
+            if self._effective_gpus != 1 or not self.gpu_device:
+                raise ValueError("Local GPU tasks require exactly one TB_GPU_DEVICE")
+
+    @classmethod
+    def _engine_cmd(cls, *args):
+        # Keep Harbor's kernel probe and result cache; only its temporary
+        # container needs to avoid the broken default docker0 bridge.
+        if args[:4] == ("container", "run", "--rm", cls._EGRESS_CONTROL_KERNEL_PROBE_IMAGE):
+            args = (*args[:3], "--network", "none", *args[3:])
+        return super()._engine_cmd(*args)
+
+    async def _write_resources_compose_file(self):
+        path = await super()._write_resources_compose_file()
+        if self._effective_gpus > 0:
+            compose = json.loads(path.read_text())
+            main = compose["services"]["main"]
+            # The explicit runtime works after a daemon config reload even when
+            # Docker's GPU DeviceRequest handler has not discovered the toolkit.
+            reservations = main.get("deploy", {}).get("resources", {}).get("reservations", {})
+            reservations.pop("devices", None)
+            main["runtime"] = "nvidia"
+            main["environment"] = {
+                "NVIDIA_VISIBLE_DEVICES": self.gpu_device,
+                "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+            }
+            path.write_text(json.dumps(compose, indent=2))
+        return path
+
+
+def needs_gpu(config):
+    for dataset in config["datasets"]:
+        included = dataset.get("task_names") or ["*"]
+        excluded = dataset.get("exclude_task_names") or []
+        for name in GPU_TASKS:
+            matches = lambda pattern: any(fnmatchcase(n, pattern) for n in (name, "terminal-bench/" + name))
+            if any(map(matches, included)) and not any(map(matches, excluded)):
+                return True
+    return False
 
 
 def integer(name, default=None, minimum=1):
@@ -52,8 +108,15 @@ def task_names(name):
 def validate(config):
     JobConfig.model_validate(config)
     Terminus2Options.model_validate(config["agents"][0].get("kwargs", {}))
-    if config["environment"]["type"] != "modal":
-        raise ValueError("This launcher requires a Modal job")
+    environment = config["environment"]
+    if environment["type"] not in {"docker", "modal"}:
+        raise ValueError("TB_ENVIRONMENT must be docker or modal")
+    if environment["type"] == "docker":
+        device = environment.get("kwargs", {}).get("gpu_device")
+        if device is not None and not re.fullmatch(r"(?:[0-9]+|GPU-[0-9a-fA-F-]+)", device):
+            raise ValueError("TB_GPU_DEVICE must be one GPU index or UUID, such as 4")
+        if device is not None and config["n_concurrent_trials"] != 1:
+            raise ValueError("A pinned local GPU requires MAX_CONCURRENCY=1; run CPU-only tasks separately for higher concurrency")
     agent = config["agents"][0]
     if len(config["agents"]) != 1 or agent["name"] != "terminus-2":
         raise ValueError("This launcher supports one Terminus 2 agent")
@@ -81,22 +144,25 @@ def make_config(root):
     if (model / "config.json").is_file():
         native_context = json.loads((model / "config.json").read_text()).get("max_position_embeddings", native_context)
     context = integer("AGENT_CONTEXT_LENGTH", native_context)
-    output = integer("MAX_OUTPUT_TOKENS", 8192)
-    if output >= context:
+    output = integer("MAX_OUTPUT_TOKENS")
+    if output is not None and output >= context:
         raise ValueError("MAX_OUTPUT_TOKENS must be smaller than AGENT_CONTEXT_LENGTH")
     kwargs = {
         "api_base": base.rstrip("/"),
         "model_info": {
             "max_input_tokens": context,
-            "max_output_tokens": output,
             "input_cost_per_token": number("AGENT_INPUT_PRICE", 0) / 1e6,
             "output_cost_per_token": number("AGENT_OUTPUT_PRICE", 0) / 1e6,
             "litellm_provider": "openai",
             "mode": "chat",
         },
-        "proactive_summarization_threshold": output,
-        "llm_call_kwargs": {"max_tokens": output},
+        "proactive_summarization_threshold": integer("AGENT_SUMMARIZATION_THRESHOLD", 8000, minimum=0),
+        "llm_call_kwargs": {},
     }
+    # Leave the output budget to the model server unless explicitly overridden.
+    if output is not None:
+        kwargs["model_info"]["max_output_tokens"] = output
+        kwargs["llm_call_kwargs"]["max_tokens"] = output
     if think != "auto":
         kwargs["llm_call_kwargs"]["extra_body"] = {"chat_template_kwargs": {"enable_thinking": think == "true"}}
         kwargs["temperature"] = number("AGENT_TEMPERATURE", 0.7 if think == "true" else 0)
@@ -110,11 +176,11 @@ def make_config(root):
     config = {
         "job_name": tag,
         "jobs_dir": str(Path(os.environ.get("TB_JOBS_DIR") or root / "results" / experiment / "terminalbench" / ckpt).resolve()),
-        "n_attempts": integer("NUM_TRIALS", 1),
-        "n_concurrent_trials": integer("MAX_CONCURRENCY", 2),
+        "n_attempts": integer("NUM_TRIALS", 5),
+        "n_concurrent_trials": integer("MAX_CONCURRENCY", 1),
         "timeout_multiplier": 1.0,
         "retry": {"max_retries": integer("MAX_RETRIES", 0, minimum=0)},
-        "environment": {"type": "modal", "delete": True},
+        "environment": {"type": os.environ.get("TB_ENVIRONMENT") or "docker", "delete": True},
         "agents": [{"name": "terminus-2", "model_name": agent_model, "kwargs": kwargs}],
         "datasets": [{
             "name": DATASET, "ref": VERSION,
@@ -124,6 +190,10 @@ def make_config(root):
             "n_tasks": integer("NUM_TASKS"),
         }],
     }
+    if config["environment"]["type"] == "docker":
+        config["environment"].update(import_path=DOCKER_IMPORT, kwargs={})
+        if device := os.environ.get("TB_GPU_DEVICE"):
+            config["environment"]["kwargs"]["gpu_device"] = device
     log = Path(os.environ.get("TB_LOG") or root / "logs" / experiment / f"terminalbench_{ckpt}_{tag}.log")
     return config, log
 
@@ -159,6 +229,31 @@ def preflight(config, discover_model):
     except Exception as exc:
         # HTTP errors can contain provider details; avoid printing response bodies/keys.
         errors.append(f"Model check failed ({type(exc).__name__}); check endpoint, model ID and credentials")
+    if config["environment"]["type"] == "docker":
+        try:
+            result = subprocess.run(["docker", "info", "--format", "{{json .}}"], capture_output=True, text=True, timeout=15)
+            if result.returncode:
+                raise ValueError("Docker daemon is inaccessible; check docker info and group membership (newgrp docker or a new login)")
+            info = json.loads(result.stdout)
+            result = subprocess.run(["docker", "compose", "version"], capture_output=True, timeout=15)
+            if result.returncode:
+                raise ValueError("Docker Compose is unavailable")
+            print(f"Docker OK: server={info['ServerVersion']}; data-root={info['DockerRootDir']}", flush=True)
+            if needs_gpu(config):
+                device = config["environment"].get("kwargs", {}).get("gpu_device")
+                if not device:
+                    raise ValueError("GPU tasks are selected; set TB_GPU_DEVICE to a dedicated GPU and MAX_CONCURRENCY=1")
+                if "nvidia" not in info.get("Runtimes", {}):
+                    raise ValueError("Docker has no NVIDIA runtime; install/configure NVIDIA Container Toolkit before running GPU tasks")
+                result = subprocess.run(["nvidia-smi", "-i", device, "--query-gpu=uuid,name,memory.used", "--format=csv,noheader"], capture_output=True, text=True, timeout=15)
+                if result.returncode:
+                    raise ValueError("TB_GPU_DEVICE is not accessible to nvidia-smi")
+                print(f"Task GPU (agent and verifier): {result.stdout.strip()}; hardware may differ from task gpu_types", flush=True)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            errors.append(f"Docker check failed: {exc}")
+        if errors:
+            raise ValueError("\n".join(errors))
+        return
     try:
         from modal.config import Config
         modal_config = Config()
@@ -183,9 +278,12 @@ def execute(command, config, log):
             print(line, flush=True)
             output.write(line + "\n")
             output.flush()
-        report(f"Terminal-Bench 4.0 | {config['agents'][0]['model_name']} | Modal | attempts={config['n_attempts']} | concurrency={config['n_concurrent_trials']}")
+        report(f"Terminal-Bench 4.0 | {config['agents'][0]['model_name']} | {config['environment']['type']} | attempts={config['n_attempts']} | concurrency={config['n_concurrent_trials']}")
         report(f"Results: {job}\nLog: {log}")
         report("Task resources/timeouts inherited. Zero token prices mean cost is unpriced.")
+        if config["environment"]["type"] == "docker":
+            device = config["environment"].get("kwargs", {}).get("gpu_device")
+            report(f"Local Docker task GPU: {device or 'none'} (agent and verifier); task GPU types are not enforced by Docker.")
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         previous = signal.signal(signal.SIGTERM, lambda signum, frame: process.send_signal(signum))
         try:
@@ -211,6 +309,9 @@ def main():
     if args.resume:
         job = args.resume.resolve()
         config = json.loads((job / "config.json").read_text())
+        requested = os.environ.get("TB_ENVIRONMENT") or "docker"
+        if config["environment"]["type"] != requested:
+            raise ValueError(f"Saved job uses {config['environment']['type']}; --resume cannot switch backends. Start a new Docker run, or explicitly set TB_ENVIRONMENT={config['environment']['type']} to resume it")
         config["jobs_dir"], config["job_name"] = str(job.parent), job.name
         log = Path(os.environ.get("TB_LOG") or root / "logs/terminalbench" / f"resume_{job.name}.log")
     else:

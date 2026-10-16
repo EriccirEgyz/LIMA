@@ -18,9 +18,17 @@ Overrides:
   TB_DATA_DIR=/path      Override the task cache (also set it when running).
 
 After setup, authenticate Modal using ONE of these methods:
+  # Browser login; creates a token and saves it to ~/.modal.toml by default.
+  # Usually needed once per machine/account, not before every evaluation.
   src/eval/terminalbench/.venv/bin/modal token new
+  # Alternatively, supply existing credentials in the evaluation shell:
   export MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=...
-Then start the model server and use run_terminalbench.sh --check.
+
+Then start the model server and configure MODEL / AGENT_BASE_URL:
+  bash src/eval/run_terminalbench.sh --dry-run  # Offline config preview.
+  bash src/eval/run_terminalbench.sh --check    # Model ID + Modal auth/connectivity.
+Neither check runs tasks; --check does not verify dataset access or sandbox capacity.
+Run run_terminalbench.sh without these flags to launch the actual evaluation.
 Setup does not start sandboxes or launch evaluations.
 EOF
     exit 0
