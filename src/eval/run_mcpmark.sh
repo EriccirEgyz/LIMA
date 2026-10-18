@@ -13,7 +13,9 @@ Default: filesystem, standard (MCPMark Verified), all tasks, k=4, serial executi
 --check-services Check selected services, Docker images, credentials and MCP/browser
                  startup without creating accounts, databases or task containers.
 --check          Also query /models and verify one structured model tool call.
-No flag          Check prerequisites, then run official agent and verifiers.
+No flag          Check prerequisites, then invoke official pipeline.main() per service.
+                 Official --k handles trials; Notion sessions close after each trial.
+                 Summary uses the official aggregator and excludes invalid runs.
 
 Model (start SGLang separately, with --tool-call-parser hermes):
  MODEL              Default models/Qwen3-8B; checkpoint/experiment naming.
@@ -453,6 +455,72 @@ def check_model(c, tool_call=False):
     print(f"Model API OK: {c['api_base']} model={c['api_model']}")
 
 
+def run_official_pipeline(c, output, service):
+    import pipeline
+    from unittest.mock import patch
+
+    class ClosingEvaluator(pipeline.MCPEvaluator):
+        def run_evaluation(self, task_filter):
+            try:
+                return super().run_evaluation(task_filter)
+            finally:
+                # The pinned entry point creates a new evaluator per trial but
+                # omits this existing upstream lifecycle hook. Stop the old sync
+                # Playwright loop before the next Notion evaluator starts one.
+                if self.mcp_service == 'notion':
+                    self.state_manager.close()
+
+    # Official pipeline uses output_dir / exp_name / model__service / run-N.
+    # exp_name=service preserves our existing output/service/model__service/run-N
+    # paths, including separate ordinary Playwright and WebArena directories.
+    argv = ['pipeline.py', '--mcp', service, '--models', c['checkpoint'],
+            '--agent', 'mcpmark', '--tasks', c['selectors'][service],
+            '--task-suite', c['task_suite'], '--exp-name', service,
+            '--output-dir', str(output), '--k', str(c['trials']),
+            '--timeout', str(c['timeout']),
+            '--compaction-token', str(c['compaction_token'])]
+    print('Official entry point: ' + ' '.join(argv), flush=True)
+    with patch.object(pipeline, 'MCPEvaluator', ClosingEvaluator), patch.object(sys, 'argv', argv):
+        pipeline.main()
+
+
+def aggregate_official(c, output):
+    from src.aggregators.aggregate_results import (
+        collect_results, check_completeness_and_validity, calculate_metrics)
+
+    results, all_tasks = {}, {}
+    for service in c['services']:
+        canonical = 'playwright' if service == 'playwright_webarena' else service
+        selected = {name.replace('/', '__') for name in c['selected_tasks'][service]}
+        all_tasks.setdefault(canonical, []).extend(sorted(selected))
+        # Adapt only the directory layout; completeness checks and all metric
+        # formulas below come from the pinned official aggregator.
+        for model, services in collect_results(output / service, c['trials']).items():
+            target = results.setdefault(model, {}).setdefault(canonical, {})
+            for runs in services.values():
+                for run, tasks in runs.items():
+                    row = target.setdefault(run, {})
+                    for task, meta in tasks.items():
+                        if task not in selected:
+                            continue
+                        if task in row:
+                            raise ValueError(f'Duplicate result: {canonical}/{run}/{task}')
+                        row[task] = meta
+    if not results:
+        raise ValueError('No results found for official aggregation')
+    complete, incomplete, invalid = check_completeness_and_validity(
+        results, all_tasks, c['trials'], [])
+    summary = calculate_metrics(complete, all_tasks, c['trials'], [])
+    n = sum(len(tasks) for tasks in all_tasks.values())
+    summary.update(task_suite=c['task_suite'], services=c['services'],
+                   scope='full-standard-127' if c['task_suite'] == 'standard' and set(c['services']) == set(STANDARD) and n == 127 else ('full-easy-50' if c['task_suite'] == 'easy' and set(c['services']) == set(STANDARD) - {'playwright'} and n == 50 else 'selected-tasks'),
+                   experiment_name=c['run_tag'], task_set=c['task_suite'],
+                   aggregation='upstream src.aggregators.aggregate_results',
+                   has_retryable_errors=bool(invalid),
+                   incomplete_models=incomplete, invalid_models=invalid)
+    return summary, bool(incomplete or invalid)
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     mode = parser.add_mutually_exclusive_group()
@@ -544,40 +612,10 @@ def main():
                         for handler in logger.handlers:
                             if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.FileHandler):
                                 handler.setStream(sys.stderr)
-                from src.evaluator import MCPEvaluator
                 print(json.dumps(c, ensure_ascii=False, indent=2))
-                from src.errors import is_retryable_error
-                failed = False
-                outcomes = {}
                 for service in c['services']:
-                    # Keep ordinary Playwright and WebArena outputs separate: upstream
-                    # otherwise puts both in the same playwright output directory.
-                    for run in range(1, c['trials'] + 1):
-                        evaluator = MCPEvaluator(mcp_service=service, model=c['checkpoint'], timeout=c['timeout'],
-                            exp_name=f'run-{run}', output_dir=output / service, task_suite=c['task_suite'],
-                            compaction_token=c['compaction_token'])
-                        report = evaluator.run_evaluation(c['selectors'][service])
-                        print(f'{service} run-{run}: {report.successful_tasks}/{report.total_tasks}')
-                        if report.total_tasks != len(c['selected_tasks'][service]):
-                            raise ValueError(f'{service}: evaluator task count differs from the selected manifest')
-                        for result in report.task_results:
-                            key = f'{service}/{result.category_id}/{result.task_id}'
-                            outcomes.setdefault(key, []).append(bool(result.success))
-                        failed |= any(is_retryable_error(r.error_message) for r in report.task_results)
-                n = len(outcomes)
-                if any(len(row) != c['trials'] for row in outcomes.values()):
-                    raise ValueError('Incomplete task/trial matrix; cannot aggregate')
-                rates = [sum(row[i] for row in outcomes.values()) / n for i in range(c['trials'])]
-                mean = sum(rates) / len(rates)
-                summary = {'task_suite': c['task_suite'], 'services': c['services'],
-                           'scope': 'full-standard-127' if c['task_suite'] == 'standard' and set(c['services']) == set(STANDARD) and n == 127 else ('full-easy-50' if c['task_suite'] == 'easy' and set(c['services']) == set(STANDARD) - {'playwright'} and n == 50 else 'selected-tasks'),
-                           'total_tasks': n, 'trials_per_task': c['trials'],
-                           'pass@1': mean, 'pass@1_per_run': rates,
-                           'pass@1_std': (sum((r - mean) ** 2 for r in rates) / len(rates)) ** 0.5,
-                           'has_retryable_errors': failed}
-                if c['trials'] > 1:
-                    summary[f"pass@{c['trials']}"] = sum(any(row) for row in outcomes.values()) / n
-                    summary[f"pass^{c['trials']}"] = sum(all(row) for row in outcomes.values()) / n
+                    run_official_pipeline(c, output, service)
+                summary, failed = aggregate_official(c, output)
                 (output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
                 print(json.dumps(summary, indent=2))
                 print(f'Results: {output}\nLog: {log}')
