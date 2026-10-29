@@ -22,6 +22,8 @@
 #   其他无调用轮 HIDE: 不作监督目标, 仍保留历史和错误反馈; 训练须 mask_history=true。
 #   所有模式保守 HIDE 明确无效调用: 实际拒绝 + 调用参数/工具声明共同确认。
 #   业务 success:false、内部异常、schema/运行冲突不自动 HIDE, 在 manifest 单列审计。
+#   可选 --hide-multi-tool-calls: 原始 system 有已知单调用禁令时, 多调用整轮 HIDE。
+#   默认关闭; 开启也只取消目标, 不拆调用、不删历史或工具返回。
 #   auto 按环境元数据/已知 system 识别模式; 未知沿用原逻辑并提示, 可显式覆盖。
 #
 # 用法(在 LIMA 根目录):
@@ -33,6 +35,7 @@
 #   终止语义已默认兼容两类 env:COMPLETED(conv_sft) + USER_STOP(非轮 RL env)
 #   = 干净终止;dag_s 产物无需额外参数。
 #   加 --dry-run 只看统计不落盘。
+#   加 --hide-multi-tool-calls 开启单调用指令违规过滤(conv/nonconv 均适用)。
 # ============================================================
 import argparse
 import ast
@@ -261,6 +264,36 @@ def _prompt_action_text(message):
     if "</think>" in text:
         return text.rsplit("</think>", 1)[1].strip()
     return "" if "<think>" in text else text.strip()
+
+
+def _single_tool_constraint(result):
+    """只识别原始首条 system 的已知中英禁令, 不从环境模式或工具说明推断。"""
+    base = next((str(m.get("content") or "") for m in result.get("messages") or []
+                 if m.get("role") == "system"), "")
+    text = " ".join(base.split()).casefold()
+    for rule in ("不要在同一步里并行调用多个工具", "不要并行调用多个工具",
+                 "do not call multiple tools in parallel"):
+        if rule in text:
+            return rule
+    return None
+
+
+def _tool_call_count(message, prompt_mode=False):
+    """计一次回复中的调用; FC 只数结构化调用, prompt 只数思考外的有效调用块。"""
+    calls = message.get("tool_calls")
+    if calls:
+        return len(calls) if isinstance(calls, list) else 1
+    if not prompt_mode:
+        return 0
+    count = 0
+    for block in re.findall(r"<tool_call>(.*?)</tool_call>", _prompt_action_text(message), re.DOTALL):
+        try:
+            call = json.loads(block)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(call, dict) and "name" in call and "arguments" in call:
+            count += 1
+    return count
 
 
 def _has_tool_call(message, prompt_mode=False):
@@ -554,14 +587,20 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
     return [(turns[i][1], turns[i + 1][1], turns[i + 1][2]) for i in range(0, len(turns) - 1, 2)]
 
 
-def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto", audit=None):
-    """逐轮切片; 无调用违规/明确无效调用 HIDE 轮只入 history, 不生成目标。"""
+def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto", audit=None,
+                          hide_multi_tool_calls=False):
+    """逐轮切片; HIDE 轮只入 history, 多调用指令违规过滤由显式开关启用。"""
     if audit is None:
         audit = {}
     mode, mode_source = resolve_interaction_mode(result, interaction_mode)
     stats[f"interaction_mode_{mode}"] += 1
     audit.update(interaction_mode=mode, mode_source=mode_source, hidden_turns=[], n_turns=0,
                  failed_call_policy="conservative_v1", call_checks=[])
+    single_tool_constraint = _single_tool_constraint(result) if hide_multi_tool_calls else None
+    audit.update(multi_tool_call_policy="hide_single_tool_violations_v1" if hide_multi_tool_calls else "disabled",
+                 single_tool_constraint=single_tool_constraint)
+    if hide_multi_tool_calls and not single_tool_constraint:
+        stats["multi_tool_filter_unrecognized_system"] += 1
     non_conversational = mode == "non-conversational"
     system, has_system, has_tools = build_system_prompt(result)
     if not has_system:
@@ -596,6 +635,14 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
         hide_reason = "invalid_tool_call" if failed_calls else None
         if hide_reason is None and non_conversational and not _has_tool_call(message, prompt_mode):
             hide_reason = _no_call_hide_reason(message, is_last, prompt_mode)
+        multi_tool_count = _tool_call_count(message, prompt_mode) if single_tool_constraint else 0
+        multi_tool_violation = multi_tool_count >= 2
+        hide_reasons = [hide_reason] if hide_reason else []
+        if multi_tool_violation:
+            hide_reasons.append("multiple_tool_calls")
+            stats["hidden_multi_tool_turns"] += 1
+            stats["multi_tool_hide_overlap"] += int(hide_reason is not None)
+            hide_reason = hide_reason or "multiple_tool_calls"
         if hide_reason:
             finish_reason = _finish_reason(message)
             hidden = {
@@ -604,6 +651,8 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
                 "is_last_assistant": is_last, "empty_content": not bool(asst_text),
                 "has_reasoning": bool(think),
             }
+            if multi_tool_violation:
+                hidden.update(hide_reasons=hide_reasons, tool_call_count=multi_tool_count)
             if failed_calls:
                 hidden["failed_calls"] = failed_calls
                 stats["hidden_failed_call_turns"] += 1
@@ -694,6 +743,9 @@ def main():
     ap.add_argument("--interaction-mode", choices=("auto", "conversational", "non-conversational"),
                     default="auto", help="auto 按已知环境/system 识别; non-conversational 无调用违规轮只入 history,"
                     "不作监督目标(训练须 mask_history=true)。未知模式沿用原逻辑并提示, 可显式指定")
+    ap.add_argument("--hide-multi-tool-calls", action="store_true",
+                    help="默认关闭; 原始 system 含已知中英单调用禁令时, 将同轮 >=2 调用整轮 HIDE。"
+                         "保留历史与工具返回, 不过滤未识别禁令的轨迹; 训练须 mask_history=true")
     ap.add_argument("--no-think", action="store_true", help="output 不拼教师 <think>(默认拼, 对齐基线)")
     ap.add_argument("--tokenizer", default=None, help="tokenizer 路径, 用于精确 token 统计(缺省则跳过)")
     ap.add_argument("--max-tokens", type=int, default=16384,
@@ -740,7 +792,8 @@ def main():
         audit = {}
         if keep:
             traj_samples = trajectory_to_samples(result, stats, with_think=not args.no_think,
-                                                 interaction_mode=args.interaction_mode, audit=audit)
+                                                 interaction_mode=args.interaction_mode, audit=audit,
+                                                 hide_multi_tool_calls=args.hide_multi_tool_calls)
             if traj_samples:
                 kept_trajs += 1
                 env_kept[env_id] += 1
@@ -773,6 +826,13 @@ def main():
           f"conversational={stats['interaction_mode_conversational']}, unknown={stats['interaction_mode_unknown']}")
     print(f"    HIDE: {stats['hidden_turns']} 轮不作目标、保留历史 (其中 length={stats['hidden_length_turns']})")
     print(f"    明确无效调用 HIDE: {stats['hidden_failed_call_turns']} 轮 (conservative_v1)")
+    if args.hide_multi_tool_calls:
+        print(f"    多调用违规 HIDE: {stats['hidden_multi_tool_turns']} 轮 "
+              f"(与已有 HIDE 重叠 {stats['multi_tool_hide_overlap']}, "
+              f"新增 {stats['hidden_multi_tool_turns'] - stats['multi_tool_hide_overlap']})")
+        if stats["multi_tool_filter_unrecognized_system"]:
+            print(f"[!] {stats['multi_tool_filter_unrecognized_system']} 条轨迹的原始 system 未识别到单调用禁令, "
+                  "未应用多调用过滤。")
     for key, count in sorted(stats.items()):
         if key.startswith("hide_reason:"):
             print(f"      {key.split(':', 1)[1]}: {count}")
