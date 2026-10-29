@@ -20,6 +20,8 @@
 #      user 消息包 <tool_response>; output 带 <think>(教师 reasoning_content)。
 #   non-conversational 无调用轮仅允许末轮精确 Task Completed 且 finish_reason=stop。
 #   其他无调用轮 HIDE: 不作监督目标, 仍保留历史和错误反馈; 训练须 mask_history=true。
+#   所有模式保守 HIDE 明确无效调用: 实际拒绝 + 调用参数/工具声明共同确认。
+#   业务 success:false、内部异常、schema/运行冲突不自动 HIDE, 在 manifest 单列审计。
 #   auto 按环境元数据/已知 system 识别模式; 未知沿用原逻辑并提示, 可显式覆盖。
 #
 # 用法(在 LIMA 根目录):
@@ -179,9 +181,16 @@ def _normalize_tool_content(content):
 def _format_tool_calls(tool_calls):
     """assistant 工具调用 → <tool_call> 文本块(复刻 QwenToolUtils.function_formatter)。"""
     blocks = []
+    if tool_calls and not isinstance(tool_calls, list):
+        tool_calls = [tool_calls]
     for tc in tool_calls or []:
-        fn = tc.get("function", {})
-        name, args = fn.get("name", ""), fn.get("arguments", "{}")
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not isinstance(fn, dict) or "name" not in fn or "arguments" not in fn:
+            # 畸形调用仍须留作恢复上下文; 不补默认参数/名字, 也不因 .get 崩溃。
+            raw = fn if isinstance(fn, dict) else tc
+            blocks.append(f"<tool_call>\n{json.dumps(raw, ensure_ascii=False)}\n</tool_call>")
+            continue
+        name, args = fn["name"], fn["arguments"]
         if isinstance(args, str):
             try:
                 args = json.loads(args)
@@ -297,6 +306,184 @@ def _no_call_hide_reason(message, is_last_assistant, prompt_mode=False):
     return None
 
 
+_ACTION_ERRORS = {
+    "Error: Failed to parse response to struct response",
+    "Error: Failed to parse response to action",
+    "Error: Invalid action",
+}
+
+
+def _failure_text(content):
+    """只认环境固定错误/顶层 success=False, 不搜索业务 data 或全文关键词。"""
+    if isinstance(content, str):
+        text = content.strip()
+        if text in _ACTION_ERRORS:
+            return text
+        if text.startswith("Error: <Exception>\nTraceback (most recent call last):"):
+            return text.splitlines()[-1].strip()
+        try:
+            content = json.loads(text)
+        except (ValueError, TypeError):
+            try:
+                content = ast.literal_eval(text)
+            except (ValueError, SyntaxError, TypeError, RecursionError):
+                return None
+    if isinstance(content, dict) and content.get("success") is False:
+        error = content.get("error", content.get("message", ""))
+        return error if isinstance(error, str) else "Unclassified failure response"
+    return None
+
+
+def _json_type_matches(value, kind):
+    """仅支持明确的 JSON 基础类型; 未知类型不能作为错误证据。"""
+    checks = {
+        "object": isinstance(value, dict), "array": isinstance(value, list),
+        "string": isinstance(value, str), "boolean": isinstance(value, bool),
+        "null": value is None,
+        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+        "integer": (isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and (not isinstance(value, float) or value.is_integer())),
+    }
+    return checks.get(kind)
+
+
+def _confirmed_call_error(call, error, schemas):
+    """返回 (HIDE/KEEP, 原因)。只过滤可由原始动作和错误反馈共同证明的错误。"""
+    fn = call.get("function")
+    if not isinstance(fn, dict) or "arguments" not in fn or "name" not in fn:
+        if error in _ACTION_ERRORS:
+            return "HIDE", "malformed_tool_call"
+        return "KEEP", "unconfirmed_call_failure"
+    name, args = fn["name"], fn["arguments"]
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (ValueError, TypeError):
+            if error in _ACTION_ERRORS:
+                return "HIDE", "malformed_arguments_json"
+            return "KEEP", "unconfirmed_call_failure"
+    if error in _ACTION_ERRORS:
+        if not isinstance(args, dict):
+            return "HIDE", "arguments_not_object"
+        if (error == "Error: Invalid action" and isinstance(name, str)
+                and schemas and name not in schemas):
+            return "HIDE", "unknown_tool_rejected"
+        return "KEEP", "unconfirmed_action_error"
+    if not isinstance(name, str) or not isinstance(args, dict):
+        return "KEEP", "unconfirmed_call_failure"
+    schema = schemas.get(name, {}).get("parameters")
+    if not isinstance(schema, dict) or any(k in schema for k in ("$ref", "anyOf", "oneOf", "allOf")):
+        return "KEEP", "unconfirmed_call_failure"
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    if not isinstance(properties, dict) or not isinstance(required, list):
+        return "KEEP", "unconfirmed_call_failure"
+
+    # Python 实参绑定异常必须指向当前公开工具, 不能把内部 helper 的异常算到模型上。
+    missing = re.fullmatch(
+        r"TypeError: ([\w.]+)\(\) missing (\d+) required (?:positional|keyword-only) arguments?: (.+)", error)
+    if missing and missing[1].split(".")[-1] == name:
+        fields = re.findall(r"'([^']+)'", missing[3])
+        if fields and len(fields) == int(missing[2]) and all(f not in args for f in fields):
+            if all(f in required for f in fields):
+                return "HIDE", "missing_required_arguments"
+            return "KEEP", "schema_runtime_conflict"
+    extra = re.fullmatch(r"TypeError: ([\w.]+)\(\) got an unexpected keyword argument '([^']+)'", error)
+    if extra and extra[1].split(".")[-1] == name and extra[2] in args:
+        if "properties" not in schema or schema.get("patternProperties"):
+            return "KEEP", "unconfirmed_parameter_error"
+        if extra[2] in properties or schema.get("additionalProperties") not in (None, False):
+            return "KEEP", "schema_runtime_conflict"
+        # 未声明参数且真实接口明确拒绝; 不声称 JSON Schema 默认禁止 additionalProperties。
+        return "HIDE", "unexpected_argument"
+
+    # 只处理顶层参数的明确类型要求, 不猜嵌套字段、枚举、非空或业务前置条件。
+    typed = re.fullmatch(
+        r"([A-Za-z_]\w*) must be (?:an? )?(?:non-empty )?"
+        r"(list|array|integer|int|boolean|bool|string|str|dict|object|number)\.?", error)
+    if typed and typed[1] in args and isinstance(properties.get(typed[1]), dict):
+        field = properties[typed[1]]
+        expected = {"list": "array", "int": "integer", "bool": "boolean",
+                    "str": "string", "dict": "object"}.get(typed[2], typed[2])
+        declared = field.get("type")
+        kinds = declared if isinstance(declared, list) else [declared]
+        if (not kinds or any(not isinstance(k, str) or _json_type_matches(None, k) is None for k in kinds)
+                or any(k in field for k in ("$ref", "anyOf", "oneOf", "allOf"))):
+            return "KEEP", "unconfirmed_parameter_error"
+        if expected not in kinds:
+            return "KEEP", "schema_runtime_conflict"
+        if all(_json_type_matches(args[typed[1]], k) is False for k in kinds):
+            return "HIDE", "wrong_argument_type"
+    return "KEEP", "unclassified_failure"
+
+
+def audit_tool_failures(result, prompt_mode=False):
+    """在原始 assistant 区间配对; 无 ID 只接受单调用和唯一返回, 模糊项保留。"""
+    messages = result.get("messages") or []
+    schemas = {}
+    for tool in result.get("tools") or []:
+        fn = tool.get("function", tool)
+        if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+            schemas[fn["name"]] = fn
+    positions = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+    findings = {}
+    for start, end in zip(positions, positions[1:] + [len(messages)]):
+        message = messages[start]
+        calls = message.get("tool_calls") or []
+        if not isinstance(calls, list):
+            calls = [calls]
+        if not calls and prompt_mode:
+            text = _prompt_action_text(message)
+            blocks = re.findall(r"<tool_call>(.*?)</tool_call>", text, re.DOTALL)
+            # prompt 执行器只用第一块; 多块/不完整块暂不推断参数归属。
+            if len(blocks) == 1 and text.count("<tool_call>") == 1:
+                try:
+                    fn = json.loads(blocks[0])
+                except ValueError:
+                    fn = None
+                calls = [{"function": fn}]
+        if not calls:
+            continue
+        responses = [(i, messages[i]) for i in range(start + 1, end)
+                     if messages[i].get("role") in {"tool", "user"}
+                     and str(messages[i].get("content") or "").strip() != STOP_MARKER]
+        id_counts = Counter(c.get("id") for c in calls if isinstance(c, dict) and c.get("id"))
+        checks = []
+        for call_index, call in enumerate(calls):
+            if not isinstance(call, dict):
+                call = {}
+            call_id = call.get("id")
+            matched = [(i, m) for i, m in responses if call_id and m.get("role") == "tool"
+                       and m.get("tool_call_id") == call_id]
+            pairing = "tool_call_id"
+            if not matched and len(calls) == 1 and len(responses) == 1:
+                i, m = responses[0]
+                content = str(m.get("content") or "").strip()
+                if m.get("role") == "user" and content in _ACTION_ERRORS:
+                    matched, pairing = [(i, m)], "single_call_action_error"
+                elif prompt_mode and m.get("role") == "user":
+                    wrapped = re.fullmatch(r"<tool_response>\s*(.*?)\s*</tool_response>", content, re.DOTALL)
+                    if wrapped:
+                        matched, pairing = [(i, dict(m, content=wrapped[1]))], "single_prompt_call"
+            fn = call.get("function")
+            check = {"message_index": start, "call_index": call_index, "tool_call_id": call_id,
+                     "tool_name": fn.get("name") if isinstance(fn, dict) else None}
+            if len(matched) != 1 or (call_id and id_counts[call_id] != 1):
+                check.update(action="KEEP", reason="unmatched_or_ambiguous_response")
+            else:
+                response_index, response = matched[0]
+                error = _failure_text(response.get("content"))
+                if error is None:
+                    continue
+                action, reason = _confirmed_call_error(call, error, schemas)
+                check.update(action=action, reason=reason, response_index=response_index,
+                             pairing=pairing, error=error)
+            checks.append(check)
+        if checks:
+            findings[start] = checks
+    return findings
+
+
 def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sources=None):
     """messages → 严格交替的 [(user_text, assistant_text, reasoning)] 列表。
 
@@ -368,12 +555,13 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
 
 
 def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto", audit=None):
-    """逐轮切片; non-conversational 的 HIDE 轮只入 history, 不生成目标。"""
+    """逐轮切片; 无调用违规/明确无效调用 HIDE 轮只入 history, 不生成目标。"""
     if audit is None:
         audit = {}
     mode, mode_source = resolve_interaction_mode(result, interaction_mode)
     stats[f"interaction_mode_{mode}"] += 1
-    audit.update(interaction_mode=mode, mode_source=mode_source, hidden_turns=[], n_turns=0)
+    audit.update(interaction_mode=mode, mode_source=mode_source, hidden_turns=[], n_turns=0,
+                 failed_call_policy="conservative_v1", call_checks=[])
     non_conversational = mode == "non-conversational"
     system, has_system, has_tools = build_system_prompt(result)
     if not has_system:
@@ -391,30 +579,41 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
         audit["conversion_error"] = "flatten_failed"
         return []
     audit["n_turns"] = len(pairs)
-    prompt_mode = _uses_prompt_tool_calls(result) if non_conversational else False
+    prompt_mode = _uses_prompt_tool_calls(result)
+    failure_checks = audit_tool_failures(result, prompt_mode)
     if non_conversational:
         audit["call_format"] = "prompt" if prompt_mode else "fc"
 
     samples = []
     for i, (user_text, asst_text, think) in enumerate(pairs):
         message_index, message = assistant_sources[i]
-        if non_conversational and not _has_tool_call(message, prompt_mode):
-            is_last = i == len(pairs) - 1
+        checks = [dict(check, turn=i) for check in failure_checks.get(message_index, [])]
+        audit["call_checks"].extend(checks)
+        for check in checks:
+            stats[f"call_check:{check['action']}:{check['reason']}"] += 1
+        failed_calls = [check for check in checks if check["action"] == "HIDE"]
+        is_last = i == len(pairs) - 1
+        hide_reason = "invalid_tool_call" if failed_calls else None
+        if hide_reason is None and non_conversational and not _has_tool_call(message, prompt_mode):
             hide_reason = _no_call_hide_reason(message, is_last, prompt_mode)
-            if hide_reason:
-                finish_reason = _finish_reason(message)
-                audit["hidden_turns"].append({
-                    "turn": i, "message_index": message_index, "action": "HIDE",
-                    "reason": hide_reason, "finish_reason": finish_reason,
-                    "is_last_assistant": is_last, "empty_content": not bool(asst_text),
-                    "has_reasoning": bool(think),
-                })
-                stats["hidden_turns"] += 1
-                stats[f"hide_reason:{hide_reason}"] += 1
-                if finish_reason == "length":
-                    stats["hidden_length_turns"] += 1
-                # pairs 保持完整, 后续 history 仍包含本轮及真实的环境反馈。
-                continue
+        if hide_reason:
+            finish_reason = _finish_reason(message)
+            hidden = {
+                "turn": i, "message_index": message_index, "action": "HIDE",
+                "reason": hide_reason, "finish_reason": finish_reason,
+                "is_last_assistant": is_last, "empty_content": not bool(asst_text),
+                "has_reasoning": bool(think),
+            }
+            if failed_calls:
+                hidden["failed_calls"] = failed_calls
+                stats["hidden_failed_call_turns"] += 1
+            audit["hidden_turns"].append(hidden)
+            stats["hidden_turns"] += 1
+            stats[f"hide_reason:{hide_reason}"] += 1
+            if finish_reason == "length":
+                stats["hidden_length_turns"] += 1
+            # pairs 保持完整; 混合成功/失败的多调用轮也整轮 HIDE, 不剪接调用或思考。
+            continue
         if think:
             stats["turns_with_think"] += 1
             output = f"<think>{think}</think>\n\n{asst_text}"
@@ -573,11 +772,14 @@ def main():
     print(f"    模式(通过轨迹筛选后): non-conversational={stats['interaction_mode_non-conversational']}, "
           f"conversational={stats['interaction_mode_conversational']}, unknown={stats['interaction_mode_unknown']}")
     print(f"    HIDE: {stats['hidden_turns']} 轮不作目标、保留历史 (其中 length={stats['hidden_length_turns']})")
+    print(f"    明确无效调用 HIDE: {stats['hidden_failed_call_turns']} 轮 (conservative_v1)")
     for key, count in sorted(stats.items()):
         if key.startswith("hide_reason:"):
             print(f"      {key.split(':', 1)[1]}: {count}")
+        elif key.startswith("call_check:"):
+            print(f"      调用审计 {key.split(':', 1)[1]}: {count}")
     if stats["interaction_mode_unknown"]:
-        print("[!] 未识别模式的轨迹沿用原转换逻辑; 请核实或使用 --interaction-mode 显式指定。")
+        print("[!] 未识别交互模式, 未启用 non-conversational 无调用规则; 可用 --interaction-mode 显式指定。")
     if stats["hidden_turns"]:
         print("[!] HIDE 历史仍在输入中, 训练必须使用 mask_history=true, 只监督当前目标。")
 
