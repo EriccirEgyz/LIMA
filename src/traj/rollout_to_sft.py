@@ -21,8 +21,9 @@
 #   non-conversational 无调用轮仅允许末轮精确 Task Completed 且 finish_reason=stop。
 #   其他无调用轮 HIDE: 不作监督目标, 仍保留历史和错误反馈; 训练须 mask_history=true。
 #   所有模式的 finish_reason=length 轮整轮 HIDE, 保留历史、工具返回及后续恢复。
-#   所有模式保守 HIDE 明确无效调用: 实际拒绝 + 调用参数/工具声明共同确认。
-#   业务 success:false、内部异常、schema/运行冲突不自动 HIDE, 在 manifest 单列审计。
+#   --failed-call-policy conservative(默认): 实际拒绝 + 参数/工具声明共同确认才 HIDE。
+#   aggressive: 已配对的明确失败反馈全部 HIDE, 包括业务 success:false、内部异常及 schema 冲突。
+#   两种策略均保留历史; 成功返回中的业务 false、未配对/不明确反馈不据此 HIDE。
 #   可选 --hide-multi-tool-calls: 原始 system 有已知单调用禁令时, 多调用整轮 HIDE。
 #   默认关闭; 开启也只取消目标, 不拆调用、不删历史或工具返回。
 #   auto 按环境元数据/已知 system 识别模式; 未知沿用原逻辑并提示, 可显式覆盖。
@@ -36,6 +37,7 @@
 #   终止语义已默认兼容两类 env:COMPLETED(conv_sft) + USER_STOP(非轮 RL env)
 #   = 干净终止;dag_s 产物无需额外参数。
 #   加 --dry-run 只看统计不落盘。
+#   加 --failed-call-policy aggressive 隐藏全部明确失败步骤; 默认 conservative 保持保守规则。
 #   加 --hide-multi-tool-calls 开启单调用指令违规过滤(conv/nonconv 均适用)。
 # ============================================================
 import argparse
@@ -59,6 +61,7 @@ QWEN_TOOL_PROMPT = (
 )
 
 STOP_MARKER = "###STOP###"
+FAILED_CALL_POLICIES = {"conservative": "conservative_v1", "aggressive": "aggressive_v1"}
 
 
 # ---------------- 1. 读取与合并 ----------------
@@ -451,8 +454,10 @@ def _confirmed_call_error(call, error, schemas):
     return "KEEP", "unclassified_failure"
 
 
-def audit_tool_failures(result, prompt_mode=False):
-    """在原始 assistant 区间配对; 无 ID 只接受单调用和唯一返回, 模糊项保留。"""
+def audit_tool_failures(result, prompt_mode=False, failed_call_policy="conservative"):
+    """可靠配对后按策略判定; aggressive 隐藏全部明确失败, 不将其等同模型错误。"""
+    if failed_call_policy not in FAILED_CALL_POLICIES:
+        raise ValueError(f"Unknown failed-call policy: {failed_call_policy}")
     messages = result.get("messages") or []
     schemas = {}
     for tool in result.get("tools") or []:
@@ -510,6 +515,10 @@ def audit_tool_failures(result, prompt_mode=False):
                 if error is None:
                     continue
                 action, reason = _confirmed_call_error(call, error, schemas)
+                if failed_call_policy == "aggressive" and action != "HIDE":
+                    # 保留保守判定依据, 便于区分策略性隐藏与确定的无效调用。
+                    check["conservative_reason"] = reason
+                    action, reason = "HIDE", "explicit_tool_failure"
                 check.update(action=action, reason=reason, response_index=response_index,
                              pairing=pairing, error=error)
             checks.append(check)
@@ -590,14 +599,16 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
 
 
 def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto", audit=None,
-                          hide_multi_tool_calls=False):
-    """逐轮切片; length 轮必 HIDE, 保留历史; 多调用指令违规过滤由显式开关启用。"""
+                          hide_multi_tool_calls=False, failed_call_policy="conservative"):
+    """逐轮切片; 失败按策略 HIDE, length 必 HIDE, 多调用可选; 完整历史保留。"""
+    if failed_call_policy not in FAILED_CALL_POLICIES:
+        raise ValueError(f"Unknown failed-call policy: {failed_call_policy}")
     if audit is None:
         audit = {}
     mode, mode_source = resolve_interaction_mode(result, interaction_mode)
     stats[f"interaction_mode_{mode}"] += 1
     audit.update(interaction_mode=mode, mode_source=mode_source, hidden_turns=[], n_turns=0,
-                 failed_call_policy="conservative_v1", call_checks=[],
+                 failed_call_policy=FAILED_CALL_POLICIES[failed_call_policy], call_checks=[],
                  length_policy="hide_generation_length_v1")
     single_tool_constraint = _single_tool_constraint(result) if hide_multi_tool_calls else None
     audit.update(multi_tool_call_policy="hide_single_tool_violations_v1" if hide_multi_tool_calls else "disabled",
@@ -622,7 +633,7 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
         return []
     audit["n_turns"] = len(pairs)
     prompt_mode = _uses_prompt_tool_calls(result)
-    failure_checks = audit_tool_failures(result, prompt_mode)
+    failure_checks = audit_tool_failures(result, prompt_mode, failed_call_policy)
     if non_conversational:
         audit["call_format"] = "prompt" if prompt_mode else "fc"
 
@@ -637,6 +648,8 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
         is_last = i == len(pairs) - 1
         finish_reason = _finish_reason(message)
         hide_reason = "invalid_tool_call" if failed_calls else None
+        if failed_calls and failed_call_policy == "aggressive":
+            hide_reason = "failed_tool_call"
         if hide_reason is None and non_conversational and not _has_tool_call(message, prompt_mode):
             hide_reason = _no_call_hide_reason(message, is_last, prompt_mode)
         multi_tool_count = _tool_call_count(message, prompt_mode) if single_tool_constraint else 0
@@ -756,6 +769,10 @@ def main():
     ap.add_argument("--hide-multi-tool-calls", action="store_true",
                     help="默认关闭; 原始 system 含已知中英单调用禁令时, 将同轮 >=2 调用整轮 HIDE。"
                          "保留历史与工具返回, 不过滤未识别禁令的轨迹; 训练须 mask_history=true")
+    ap.add_argument("--failed-call-policy", choices=tuple(FAILED_CALL_POLICIES), default="conservative",
+                    help="失败调用策略: conservative(默认)仅隐藏确认无效的调用; aggressive 隐藏已配对的"
+                         "全部明确失败反馈(含 success:false、执行异常和调用拒绝)。整轮取消监督、保留历史;"
+                         "成功返回中的业务 false 或未配对/不明确反馈不据此隐藏; 训练须 mask_history=true")
     ap.add_argument("--no-think", action="store_true", help="output 不拼教师 <think>(默认拼, 对齐基线)")
     ap.add_argument("--tokenizer", default=None, help="tokenizer 路径, 用于精确 token 统计(缺省则跳过)")
     ap.add_argument("--max-tokens", type=int, default=16384,
@@ -803,7 +820,8 @@ def main():
         if keep:
             traj_samples = trajectory_to_samples(result, stats, with_think=not args.no_think,
                                                  interaction_mode=args.interaction_mode, audit=audit,
-                                                 hide_multi_tool_calls=args.hide_multi_tool_calls)
+                                                 hide_multi_tool_calls=args.hide_multi_tool_calls,
+                                                 failed_call_policy=args.failed_call_policy)
             if traj_samples:
                 kept_trajs += 1
                 env_kept[env_id] += 1
@@ -838,7 +856,8 @@ def main():
     print(f"    生成截断 HIDE: {stats['hidden_length_turns']} 轮 "
           f"(与其他规则重叠 {stats['length_hide_overlap']}, "
           f"新增 {stats['hidden_length_turns'] - stats['length_hide_overlap']})")
-    print(f"    明确无效调用 HIDE: {stats['hidden_failed_call_turns']} 轮 (conservative_v1)")
+    print(f"    失败调用 HIDE: {stats['hidden_failed_call_turns']} 轮 "
+          f"({FAILED_CALL_POLICIES[args.failed_call_policy]})")
     if args.hide_multi_tool_calls:
         print(f"    多调用违规 HIDE: {stats['hidden_multi_tool_turns']} 轮 "
               f"(与已有 HIDE 重叠 {stats['multi_tool_hide_overlap']}, "
