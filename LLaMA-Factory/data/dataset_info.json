@@ -789,5 +789,49 @@
       "history": "history",
       "system": "system"
     }
+  },
+  "spbench_sft_v2": {
+    "file_name": "spbench_sft_v2.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "history": "history",
+      "system": "system"
+    }
+  },
+  "dag_s_sft_v2": {
+    "file_name": "dag_s_sft_v2.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "history": "history",
+      "system": "system"
+    }
+  },
+  "spbench_route1_sft_v2": {
+    "file_name": "spbench_route1_sft_v2.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "history": "history",
+      "system": "system"
+    }
+  },
+  "spbench_route1_sft_v2_32k": {
+    "file_name": "spbench_route1_sft_v2_32k.json",
+    "formatting": "alpaca",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output",
+      "history": "history",
+      "system": "system"
+    }
   }
 }

@@ -1,0 +1,50 @@
+### spbench route1 v2 32K 子集 — Qwen3-8B 全参数 SFT
+### 从 spbench_route1_sft_v2.yaml 派生，仅更改 dataset 和 output_dir。
+### 以当前 LLaMA-Factory 的 qwen3 模板、Qwen3-8B tokenizer 和本配置的
+### mask_history/默认 thinking 设置计算截断前长度，保留 <= 32768 tokens 的样本。
+### 子集含 6282 个训练样本、177 个任务；原始 v2 数据保留不变。
+### 使用 8 张卡时，effective batch = 8 × 2 × 16 = 256。
+### 训练前激活 gyz_sft 并设置 CUDA_HOME 等运行环境；启动时设置 FORCE_TORCHRUN=1。
+
+### model
+model_name_or_path: /data/home/chengyushen/yizhigao/LIMA/models/Qwen3-8B
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z2_config.json
+flash_attn: fa2
+enable_liger_kernel: true
+
+### dataset
+dataset: spbench_route1_sft_v2_32k
+dataset_dir: data
+template: qwen3
+mask_history: true
+cutoff_len: 32768
+max_samples: 1000000
+overwrite_cache: true
+preprocessing_num_workers: 16
+dataloader_num_workers: 8
+
+### output
+output_dir: models/qwen3-8b/spbench_route1_sft_v2_32k
+logging_steps: 10
+save_steps: 26
+plot_loss: true
+overwrite_output_dir: false
+save_only_model: false
+report_to: tensorboard
+save_strategy: epoch
+
+### train
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 64
+learning_rate: 1.0e-6
+num_train_epochs: 10
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
