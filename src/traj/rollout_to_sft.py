@@ -20,6 +20,7 @@
 #      user 消息包 <tool_response>; output 带 <think>(教师 reasoning_content)。
 #   non-conversational 无调用轮仅允许末轮精确 Task Completed 且 finish_reason=stop。
 #   其他无调用轮 HIDE: 不作监督目标, 仍保留历史和错误反馈; 训练须 mask_history=true。
+#   所有模式的 finish_reason=length 轮整轮 HIDE, 保留历史、工具返回及后续恢复。
 #   所有模式保守 HIDE 明确无效调用: 实际拒绝 + 调用参数/工具声明共同确认。
 #   业务 success:false、内部异常、schema/运行冲突不自动 HIDE, 在 manifest 单列审计。
 #   可选 --hide-multi-tool-calls: 原始 system 有已知单调用禁令时, 多调用整轮 HIDE。
@@ -523,7 +524,8 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
     - 连续 tool 消息(并行调用结果)合并为一个 user 轮, 多个 <tool_response> 块以 \\n 相接
     - ###STOP### 为 harness 控制消息, 剔除
     - reasoning 取自该 assistant 消息的 reasoning_content, 与轮次天然对齐
-    - non-conversational 保留空 assistant, 作为 HIDE 历史; 不虚构正文/补思考
+    - non-conversational 或 finish_reason=length 保留空 assistant, 作为 HIDE 历史
+      不虚构正文/补思考, 不因丢掉截断轮破坏后续对话交替
     - assistant_sources 可接收与返回 pairs 对齐的 (原始消息索引, 原始消息)
     - 结尾多余的非 assistant 轮裁掉; 异常交替(如连续 assistant)则整条轨迹弃用
     """
@@ -564,7 +566,7 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
                 parts.append(tc_text)
             if not parts:
                 stats["empty_assistant_msgs"] += 1
-                if not preserve_empty_assistant:
+                if not preserve_empty_assistant and _finish_reason(m) != "length":
                     continue
             reasoning = str(m.get("reasoning_content") or "").strip()
             turns.append(("assistant", "\n".join(parts), reasoning))
@@ -589,13 +591,14 @@ def flatten_turns(result, stats, preserve_empty_assistant=False, assistant_sourc
 
 def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto", audit=None,
                           hide_multi_tool_calls=False):
-    """逐轮切片; HIDE 轮只入 history, 多调用指令违规过滤由显式开关启用。"""
+    """逐轮切片; length 轮必 HIDE, 保留历史; 多调用指令违规过滤由显式开关启用。"""
     if audit is None:
         audit = {}
     mode, mode_source = resolve_interaction_mode(result, interaction_mode)
     stats[f"interaction_mode_{mode}"] += 1
     audit.update(interaction_mode=mode, mode_source=mode_source, hidden_turns=[], n_turns=0,
-                 failed_call_policy="conservative_v1", call_checks=[])
+                 failed_call_policy="conservative_v1", call_checks=[],
+                 length_policy="hide_generation_length_v1")
     single_tool_constraint = _single_tool_constraint(result) if hide_multi_tool_calls else None
     audit.update(multi_tool_call_policy="hide_single_tool_violations_v1" if hide_multi_tool_calls else "disabled",
                  single_tool_constraint=single_tool_constraint)
@@ -632,6 +635,7 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
             stats[f"call_check:{check['action']}:{check['reason']}"] += 1
         failed_calls = [check for check in checks if check["action"] == "HIDE"]
         is_last = i == len(pairs) - 1
+        finish_reason = _finish_reason(message)
         hide_reason = "invalid_tool_call" if failed_calls else None
         if hide_reason is None and non_conversational and not _has_tool_call(message, prompt_mode):
             hide_reason = _no_call_hide_reason(message, is_last, prompt_mode)
@@ -643,16 +647,22 @@ def trajectory_to_samples(result, stats, with_think=True, interaction_mode="auto
             stats["hidden_multi_tool_turns"] += 1
             stats["multi_tool_hide_overlap"] += int(hide_reason is not None)
             hide_reason = hide_reason or "multiple_tool_calls"
+        if finish_reason == "length":
+            # 单次生成截断与轨迹最终是否完成无关; 有完整工具块也不监督该轮。
+            stats["length_hide_overlap"] += int(hide_reason is not None)
+            hide_reasons.append("generation_length")
+            hide_reason = hide_reason or "generation_length"
         if hide_reason:
-            finish_reason = _finish_reason(message)
             hidden = {
                 "turn": i, "message_index": message_index, "action": "HIDE",
                 "reason": hide_reason, "finish_reason": finish_reason,
                 "is_last_assistant": is_last, "empty_content": not bool(asst_text),
                 "has_reasoning": bool(think),
             }
+            if multi_tool_violation or finish_reason == "length":
+                hidden["hide_reasons"] = hide_reasons
             if multi_tool_violation:
-                hidden.update(hide_reasons=hide_reasons, tool_call_count=multi_tool_count)
+                hidden["tool_call_count"] = multi_tool_count
             if failed_calls:
                 hidden["failed_calls"] = failed_calls
                 stats["hidden_failed_call_turns"] += 1
@@ -825,6 +835,9 @@ def main():
     print(f"    模式(通过轨迹筛选后): non-conversational={stats['interaction_mode_non-conversational']}, "
           f"conversational={stats['interaction_mode_conversational']}, unknown={stats['interaction_mode_unknown']}")
     print(f"    HIDE: {stats['hidden_turns']} 轮不作目标、保留历史 (其中 length={stats['hidden_length_turns']})")
+    print(f"    生成截断 HIDE: {stats['hidden_length_turns']} 轮 "
+          f"(与其他规则重叠 {stats['length_hide_overlap']}, "
+          f"新增 {stats['hidden_length_turns'] - stats['length_hide_overlap']})")
     print(f"    明确无效调用 HIDE: {stats['hidden_failed_call_turns']} 轮 (conservative_v1)")
     if args.hide_multi_tool_calls:
         print(f"    多调用违规 HIDE: {stats['hidden_multi_tool_turns']} 轮 "
