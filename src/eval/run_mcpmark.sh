@@ -61,6 +61,9 @@ Docker/services:
            Container names are prefixed lima-mcpmark-<uid>; default ports are
            17770 (shopping), 17780 (admin), 19999 (reddit). Optional overrides:
            WEBARENA_SHOPPING_PORT / WEBARENA_SHOPPING_ADMIN_PORT / WEBARENA_REDDIT_PORT.
+           For the existing private Docker namespace, unset DOCKER_CONTEXT and set
+           DOCKER_HOST=unix:///run/lima-docker/docker.sock WEBARENA_HOST=10.255.254.2.
+           This binds/publishes WebArena there without changing Docker configuration.
  See setup_mcpmark.sh --help for browser/image installation.
 
 Examples:
@@ -102,6 +105,7 @@ import json
 import math
 import os
 from pathlib import Path
+import pwd
 import re
 import shutil
 import socket
@@ -117,6 +121,8 @@ ROOT = Path(os.environ['REPO_ROOT'])
 UPSTREAM = Path(os.environ['MCPMARK_DIR'])
 PG_IMAGE = 'pgvector/pgvector:0.8.0-pg17-bookworm'
 GH_IMAGE = 'ghcr.io/github/github-mcp-server:v0.15.0'
+PRIVATE_DOCKER = 'unix:///run/lima-docker/docker.sock'
+PRIVATE_WEB_HOST = '10.255.254.2'
 WEB = {'shopping': ('shopping_final_0712', 17770),
        'shopping_admin': ('shopping_admin_final_0719', 17780),
        'reddit': ('postmill-populated-exposed-withimg', 19999)}
@@ -179,7 +185,7 @@ def config():
     if url.scheme not in {'http', 'https'} or not url.hostname or url.username or url.password or url.query or url.fragment:
         raise ValueError('AGENT_BASE_URL must be an HTTP(S) base URL without embedded credentials/query')
     selectors = {s: os.environ.get(s.upper() + '_TASKS') or os.environ.get('TASKS') or 'all' for s in services}
-    return dict(commit=PIN, model_weights=str(model), checkpoint=ckpt, experiment=experiment,
+    c = dict(commit=PIN, model_weights=str(model), checkpoint=ckpt, experiment=experiment,
                 run_tag=tag, services=services, task_suite=suite, selectors=selectors,
                 api_base=base, api_model=os.environ.get('AGENT_MODEL'), enable_think=thinking,
                 temperature=temperature,
@@ -187,6 +193,14 @@ def config():
                 generation_policy='endpoint defaults unless explicitly overridden',
                 trials=positive('NUM_TRIALS', 4), timeout=positive('TASK_TIMEOUT', 3600),
                 max_steps=positive('MAX_STEPS', 100), compaction_token=positive('COMPACTION_TOKEN', 999999999))
+    if 'playwright_webarena' in services:
+        host = os.environ.get('WEBARENA_HOST') or '127.0.0.1'
+        if host not in {'127.0.0.1', PRIVATE_WEB_HOST}:
+            raise ValueError('WEBARENA_HOST must be 127.0.0.1 or ' + PRIVATE_WEB_HOST)
+        # Preserve the saved config of existing local runs when this is unset.
+        if host != '127.0.0.1':
+            c['webarena_host'] = host
+    return c
 
 
 def notion_browser_proxy():
@@ -270,7 +284,14 @@ def install_adapters(c):
     AGENT_REGISTRY['mcpmark'] = LocalAgent
     # Isolate shared-host container names. Keep upstream's Magento configuration
     # branches working by calling them after the category-specific setup.
-    from src.mcp_services.playwright_webarena.playwright_state_manager import PlaywrightStateManager
+    from src.mcp_services.playwright_webarena.playwright_state_manager import DockerConfig, PlaywrightStateManager
+    web_host = c.get('webarena_host')
+
+    class LocalWebArenaConfig(DockerConfig):
+        @property
+        def base_url(self):
+            return f'http://{web_host}:{self.host_port}'
+
     class LocalWebArena(PlaywrightStateManager):
         CATEGORY_CONFIGS = {k: {**v, 'container_name': f'lima-mcpmark-{os.getuid()}-{k}',
                                'host_port': positive('WEBARENA_' + k.upper() + '_PORT', WEB[k][1])}
@@ -278,13 +299,29 @@ def install_adapters(c):
 
         def __init__(self, **kwargs):
             super().__init__(docker_container_name=f'lima-mcpmark-{os.getuid()}-shopping_admin', **kwargs)
+            if web_host:
+                self.config = LocalWebArenaConfig(**vars(self.config))
 
         def _run_cmd(self, args, **kwargs):
             if args[:2] == ['docker', 'run']:
                 args = args[:2] + ['--network', f'lima-mcpmark-{os.getuid()}',
                         '--label', f'lima.mcpmark.owner={os.getuid()}'] + args[2:]
                 index = args.index('-p') + 1
-                args[index] = '127.0.0.1:' + args[index]
+                args[index] = (web_host or '127.0.0.1') + ':' + args[index]
+            elif web_host and args[:3] == ['docker', 'exec', self.config.container_name]:
+                # The pinned Magento setup hardcodes localhost in these two commands.
+                # Rewrite only their exact URL arguments for this manager's container.
+                old_url = f'http://localhost:{self.config.host_port}'
+                old_sql = (f"UPDATE core_config_data SET value='{old_url}/' "
+                           "WHERE path IN ('web/secure/base_url', 'web/unsecure/base_url');")
+                args = list(args)
+                if 'setup:store-config:set' in args:
+                    args = [f'--base-url={self.config.base_url}' if a == f'--base-url={old_url}' else a
+                            for a in args]
+                elif len(args) > 3 and args[3] == 'mysql' and '-e' in args:
+                    index = args.index('-e') + 1
+                    if index < len(args) and args[index] == old_sql:
+                        args[index] = old_sql.replace(old_url, self.config.base_url)
             return super()._run_cmd(args, **kwargs)
 
         def _wait_until_ready(self):
@@ -329,6 +366,35 @@ def require_image(image):
         process(['docker', 'image', 'inspect', image, '--format', '{{.Id}}'])
     except subprocess.CalledProcessError:
         raise ValueError(f'Missing Docker image {image}; run setup_mcpmark.sh --prepare-docker for this service') from None
+
+
+def check_webarena_ports(c, ports):
+    host = c.get('webarena_host')
+    if not host:
+        if os.environ.get('DOCKER_HOST') == PRIVATE_DOCKER:
+            raise ValueError('Private Docker requires WEBARENA_HOST=' + PRIVATE_WEB_HOST)
+        for port in ports:
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', port))
+        return
+    if os.environ.get('DOCKER_HOST') != PRIVATE_DOCKER or os.environ.get('DOCKER_CONTEXT'):
+        raise ValueError('Private WebArena requires DOCKER_HOST=' + PRIVATE_DOCKER + ' and unset DOCKER_CONTEXT')
+    expected_root = Path(pwd.getpwuid(os.getuid()).pw_dir) / '.local/share/lima-docker/docker'
+    actual_root = process(['docker', 'info', '--format', '{{.DockerRootDir}}'])
+    if Path(actual_root) != expected_root:
+        raise ValueError('Private Docker data root mismatch: ' + actual_root)
+    # Published ports live in the daemon's namespace; a host-side bind cannot check them.
+    ids = process(['docker', 'ps', '-q']).split()
+    if ids:
+        bindings = process(['docker', 'inspect', '--format', '{{json .NetworkSettings.Ports}}', *ids])
+        for line in bindings.splitlines():
+            for container_port, entries in (json.loads(line) or {}).items():
+                if not container_port.endswith('/tcp'):
+                    continue
+                for entry in entries or []:
+                    if entry['HostIp'] in {host, '0.0.0.0', '::', ''} and int(entry['HostPort']) in ports:
+                        raise ValueError(f"WebArena port already published: {entry['HostIp']}:{entry['HostPort']}")
+    # Docker's actual container creation performs the final collision check.
 
 
 def check_services(c):
@@ -394,11 +460,13 @@ def check_services(c):
                 except subprocess.CalledProcessError:
                     raise ValueError('WebArena Docker network missing; run setup_mcpmark.sh --prepare-docker webarena') from None
                 categories = {x.split('/')[0] for x in c['selected_tasks'][service]}
+                ports = [positive('WEBARENA_' + category.upper() + '_PORT', WEB[category][1])
+                         for category in sorted(categories)]
+                if len(set(ports)) != len(ports):
+                    raise ValueError('WebArena categories must use distinct host ports')
+                check_webarena_ports(c, ports)
                 for category in sorted(categories):
                     require_image(WEB[category][0])
-                    port = positive('WEBARENA_' + category.upper() + '_PORT', WEB[category][1])
-                    with socket.socket() as sock:
-                        sock.bind(('127.0.0.1', port))
             if service in {'notion', 'playwright', 'playwright_webarena'}:
                 from playwright.sync_api import sync_playwright
                 with sync_playwright() as p:
@@ -561,7 +629,7 @@ def main():
     os.environ['LIMA_MCPMARK_KEY'] = key or 'placeholder'
     os.environ['LIMA_MCPMARK_BASE'] = c['api_base']
     for name in ('NO_PROXY', 'no_proxy'):
-        os.environ[name] = ','.join(filter(None, [os.environ.get(name), 'localhost,127.0.0.1,::1']))
+        os.environ[name] = ','.join(filter(None, [os.environ.get(name), 'localhost,127.0.0.1,::1', c.get('webarena_host')]))
     errors = check_services(c)
     if not args.check_services:
         try:
