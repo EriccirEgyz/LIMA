@@ -23,9 +23,9 @@
 #   1. bash src/eval/setup_tau2_bench.sh
 #   2. bash src/eval/serve_envfactory.sh  (wait until server is ready) -- launch
 #      it with the SAME MODEL you pass here: this script never loads weights, so
-#      MODEL is only the label sent to the server (sglang ignores the request's
-#      model field) plus the bookkeeping key for results/logs. What actually gets
-#      evaluated is whatever the server loaded.
+#      MODEL labels results/logs and is checked against the server's /models
+#      response. What actually gets evaluated is whatever the server loaded;
+#      a custom served-model-name alias does not prove the underlying weights.
 #   3. Set environment variables for the user simulator (and, by default, the
 #      evaluator -- the paper uses DeepSeek-V3.2-Chat for BOTH):
 #        export USER_API_KEY="sk-xxx"
@@ -72,9 +72,9 @@ TAU2_DIR="$EVAL_DIR/tau2-bench"
 source "$EVAL_DIR/cache_env.sh"
 
 # === Agent model (local SGLang) ===
-# MODEL = local weights dir, used ONLY for bookkeeping (experiment/ckpt name
-#         inference + the agent label). AGENT_MODEL = the name sent in requests;
-#         defaults to the checkpoint basename.
+# MODEL = local weights dir, used for bookkeeping and the server identity check;
+#         this script never loads weights. AGENT_MODEL = the name sent in
+#         requests; defaults to the checkpoint basename.
 SGLANG_PORT=${SGLANG_PORT:-8000}
 SGLANG_API_KEY=${SGLANG_API_KEY:-"placeholder"}
 MODEL=${MODEL:-"$REPO_ROOT/models/envfactory_baseline/EnvFactory-1.7B"}
@@ -88,6 +88,8 @@ AGENT_BASE_URL=${AGENT_BASE_URL:-"http://localhost:${SGLANG_PORT}/v1"}
 USER_MODEL=${USER_MODEL:-"deepseek-v3.2"}
 USER_BASE_URL=${USER_BASE_URL:?"ERROR: Set USER_BASE_URL (e.g. https://your-provider.com/v1)"}
 USER_API_KEY=${USER_API_KEY:?"ERROR: Set USER_API_KEY"}
+# Explicit --user-llm-args replaces tau2's default dict, including temperature.
+USER_TEMPERATURE=${USER_TEMPERATURE:-0}
 
 # === Evaluator / NL-assertions judge (third-party OpenAI-compatible) ===
 # Defaults to the user-simulator endpoint (paper uses DeepSeek-V3.2-Chat for
@@ -142,6 +144,94 @@ export TAU2_EVAL_API_KEY="$EVAL_API_KEY"
 export OPENAI_API_KEY="${OPENAI_API_KEY:-$EVAL_API_KEY}"
 export OPENAI_API_BASE="${OPENAI_API_BASE:-$USER_BASE_URL}"
 
+# Validate before creating result directories, input links, or the run log.
+if [ ! -d "$TAU2_DIR" ]; then
+    echo "ERROR: tau2-bench not found. Run: bash src/eval/setup_tau2_bench.sh"
+    exit 1
+fi
+
+if [ ! -d "$MODEL" ]; then
+    echo "ERROR: weights dir not found: $MODEL"
+    echo "Pass MODEL=/path/to/checkpoint (and serve it with the same path via"
+    echo "serve_envfactory.sh)."
+    exit 1
+fi
+
+# Keep the key in the environment/header, and never print response bodies or
+# request exceptions: either may contain credentials from an upstream service.
+AGENT_BASE_URL="$AGENT_BASE_URL" SGLANG_API_KEY="$SGLANG_API_KEY" \
+MODEL="$MODEL" AGENT_MODEL="$AGENT_MODEL" USER_TEMPERATURE="$USER_TEMPERATURE" \
+python3 - <<'PY'
+import http.client
+import json
+import math
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+def fail(message):
+    sys.exit(f"ERROR: {message}")
+
+try:
+    temperature = json.loads(os.environ["USER_TEMPERATURE"])
+    valid_temperature = (not isinstance(temperature, bool)
+                         and isinstance(temperature, (int, float))
+                         and math.isfinite(temperature) and temperature >= 0)
+except (ValueError, OverflowError):
+    valid_temperature = False
+if not valid_temperature:
+    fail("USER_TEMPERATURE must be a finite non-negative JSON number.")
+
+class NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        return None
+
+try:
+    base_url = os.environ["AGENT_BASE_URL"].rstrip("/")
+    url = urllib.parse.urlsplit(base_url)
+    if (url.scheme not in ("http", "https") or not url.hostname
+            or url.username or url.password or url.query or url.fragment):
+        fail("AGENT_BASE_URL must be an HTTP(S) API base without URL credentials, query, or fragment.")
+    request = urllib.request.Request(
+        base_url + "/models",
+        headers={"Authorization": "Bearer " + os.environ["SGLANG_API_KEY"]},
+    )
+    # Do not forward the Authorization header to a redirected endpoint.
+    opener = urllib.request.build_opener(NoRedirects)
+    with opener.open(request, timeout=10) as response:
+        if not 200 <= response.status < 300:
+            fail(f"Agent /models returned HTTP {response.status}.")
+        payload = json.load(response)
+except urllib.error.HTTPError as error:
+    fail(f"Agent /models returned HTTP {error.code}.")
+except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException):
+    fail("Agent /models request failed or timed out; check AGENT_BASE_URL and server availability.")
+except (ValueError, UnicodeError):
+    fail("Agent /models returned invalid JSON, or the request configuration is invalid.")
+
+models = payload.get("data") if isinstance(payload, dict) else None
+if not isinstance(models, list) or not models:
+    fail("Agent /models response must contain a non-empty data list.")
+if any(not isinstance(item, dict) or not isinstance(item.get("id"), str)
+       or not item["id"].strip() for item in models):
+    fail("Agent /models response contains an invalid model identifier.")
+
+expected_path = os.path.realpath(os.environ["MODEL"])
+expected_name = os.environ["AGENT_MODEL"]
+def matches(model_id):
+    # A served-model-name alias can match exactly. Absolute paths must resolve
+    # to the expected weights; a matching basename alone is not sufficient.
+    return (model_id == expected_name
+            or (os.path.isabs(model_id)
+                and os.path.realpath(model_id) == expected_path))
+
+if not any(matches(item["id"]) for item in models):
+    fail("Agent /models does not match MODEL or AGENT_MODEL; check the loaded weights and served model name.")
+print("Agent preflight passed: /models matches the expected weights path or model name.")
+PY
+
 # Redirect tau2's output into our results tree instead of burying it inside the
 # vendored tau2-bench checkout (where it'd be lost on re-clone). tau2 uses one
 # DATA_DIR for both input (tau2/domains/...) and output (simulations/), so we
@@ -176,25 +266,6 @@ mkdir -p "$LOG_DIR"
 TAU2_LOG=${TAU2_LOG:-"$LOG_DIR/tau2_${CKPT_NAME}_${RUN_TAG}.log"}
 exec > >(tee -a "$TAU2_LOG") 2>&1
 
-# === Validate ===
-if [ ! -d "$TAU2_DIR" ]; then
-    echo "ERROR: tau2-bench not found. Run: bash src/eval/setup_tau2_bench.sh"
-    exit 1
-fi
-
-if [ ! -d "$MODEL" ]; then
-    echo "ERROR: weights dir not found: $MODEL"
-    echo "Pass MODEL=/path/to/checkpoint (and serve it with the same path via"
-    echo "serve_envfactory.sh)."
-    exit 1
-fi
-
-if ! curl -s "http://localhost:$SGLANG_PORT/v1/models" > /dev/null 2>&1; then
-    echo "ERROR: SGLang server not responding on port $SGLANG_PORT."
-    echo "Start it with: bash src/eval/serve_envfactory.sh"
-    exit 1
-fi
-
 # === Determine domains ===
 if [ "$RUN_ALL" = true ]; then
     DOMAINS=("retail" "airline" "telecom")
@@ -204,7 +275,7 @@ fi
 
 # === Build litellm args JSON ===
 AGENT_LLM_ARGS="{\"api_base\": \"$AGENT_BASE_URL\", \"api_key\": \"$SGLANG_API_KEY\", \"temperature\": $TEMPERATURE}"
-USER_LLM_ARGS="{\"api_base\": \"$USER_BASE_URL\", \"api_key\": \"$USER_API_KEY\"}"
+USER_LLM_ARGS="{\"api_base\": \"$USER_BASE_URL\", \"api_key\": \"$USER_API_KEY\", \"temperature\": $USER_TEMPERATURE}"
 
 echo "=============================================="
 echo " tau2-bench Evaluation"
@@ -217,6 +288,7 @@ echo " Agent Model:    openai/$AGENT_MODEL ($AGENT_BASE_URL)"
 echo " User Model:     openai/$USER_MODEL ($USER_BASE_URL)"
 echo " Evaluator:      openai/$EVAL_MODEL ($EVAL_BASE_URL)"
 echo " Temperature:    $TEMPERATURE"
+echo " User temp:      $USER_TEMPERATURE"
 echo " Concurrency:    $MAX_CONCURRENCY"
 echo " Run tag:        $RUN_TAG"
 echo " Results root:   $TAU2_RUN_ROOT"
