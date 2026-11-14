@@ -13,6 +13,8 @@
 #      由 src/select/select_route1.py 生成), join 键 = task_info.global_id。
 #   2. 筛选: result_status=completed + termination_reason=COMPLETED +
 #      rubric_eval.avg_result >= min-score + judge parse_success。
+#      可选 --per-task-selection random-one: 每题从可转换的合格轨迹中随机保留一条;
+#      默认 all 全保留。分数阈值仍由 --min-score 控制, 默认 1.0=只收满分。
 #   3. 展开为 alpaca 逐轮切片: 一条轨迹 → 每个 assistant 轮一个样本
 #      (history 递增前缀, 该轮为 output)。基线 26463 条即此结构。
 #   4. 格式: system 内嵌 <tools>(逐字节复刻 LLaMA-Factory QwenToolUtils 的
@@ -39,12 +41,14 @@
 #   加 --dry-run 只看统计不落盘。
 #   加 --failed-call-policy aggressive 隐藏全部明确失败步骤; 默认 conservative 保持保守规则。
 #   加 --hide-multi-tool-calls 开启单调用指令违规过滤(conv/nonconv 均适用)。
+#   加 --per-task-selection random-one --selection-seed 42 每题最多一条, 固定种子可复现。
 # ============================================================
 import argparse
 import ast
 import glob
 import json
 import os
+import random
 import re
 import sys
 import time
@@ -751,12 +755,49 @@ def percentile(sorted_vals, q):
     return sorted_vals[idx]
 
 
+def select_one_per_task(manifest, records, seed):
+    """从转换成功的候选中每题选一条, 返回 manifest 行号并补充选择审计。"""
+    groups = defaultdict(list)
+    for index, row in enumerate(manifest):
+        if not row["kept"]:
+            continue
+        info = records[(row["task_index"], row["sample_idx"])].get("task_info") or {}
+        gid = info.get("global_id")
+        # 使用带类型的键, 避免缺失 global_id 的 task_index 与真实 global_id 撞车。
+        key = ("global_id", str(gid)) if gid is not None else ("task_index", str(row["task_index"]))
+        groups[key].append(index)
+
+    selected = set()
+    for key, indices in groups.items():
+        indices.sort(key=lambda i: (manifest[i]["task_index"], manifest[i]["sample_idx"]))
+        # 每题独立 RNG; 名单过滤、其他题增删及输入记录顺序不影响本题选择。
+        rng = random.Random(json.dumps([seed, *key], ensure_ascii=False))
+        chosen = rng.choice(indices)
+        selected.add(chosen)
+        chosen_row = manifest[chosen]
+        for index in indices:
+            row = manifest[index]
+            row["per_task_selection"] = {
+                "mode": "random-one", "seed": seed,
+                "group_by": key[0], "group_id": key[1], "candidate_count": len(indices),
+                "selected_task_index": chosen_row["task_index"],
+                "selected_sample_idx": chosen_row["sample_idx"],
+                "n_samples_before_selection": row["n_samples"],
+            }
+    return selected
+
+
 def main():
     ap = argparse.ArgumentParser(description="spbench rollout 产物 → EnvFactory 同构 alpaca SFT 数据集")
     ap.add_argument("--input", required=True,
                     help="rollout 输出父目录(自动合并所有 *_incremental_shards) / 单个分片目录 / .runs.jsonl / 最终 .json")
     ap.add_argument("--out", default="data/sft/spbench_v1/spbench_sft.json", help="输出 alpaca json 路径")
     ap.add_argument("--min-score", type=float, default=1.0, help="rubric avg_result 阈值(默认 1.0=满分)")
+    ap.add_argument("--per-task-selection", choices=("all", "random-one"), default="all",
+                    help="all(默认)保留全部合格轨迹; random-one 每题随机保留一条可转换的合格轨迹。"
+                         "按 global_id 分组, 缺失时用 task_index; 分数阈值仍由 --min-score 控制")
+    ap.add_argument("--selection-seed", type=int, default=42,
+                    help="random-one 的随机种子(默认 42); 同题候选相同则选择可复现, all 模式忽略")
     ap.add_argument("--accept-termination", default="COMPLETED,USER_STOP",
                     help="允许的 termination_reason 集合,逗号分隔。默认两值并集=干净终止"
                          "(conv_sft 落 COMPLETED,非轮 RL env 落 USER_STOP,已实证存量 spbench 0 条 USER_STOP);"
@@ -807,6 +848,7 @@ def main():
     reject_reasons = Counter()
     env_kept = Counter()
     env_total = Counter()
+    conversion_stats = {}
 
     for (ti, si), result in sorted(records.items()):
         info = result.get("task_info") or {}
@@ -818,10 +860,14 @@ def main():
         n_samples = 0
         audit = {}
         if keep:
-            traj_samples = trajectory_to_samples(result, stats, with_think=not args.no_think,
+            traj_stats = stats if args.per_task_selection == "all" else Counter()
+            traj_samples = trajectory_to_samples(result, traj_stats, with_think=not args.no_think,
                                                  interaction_mode=args.interaction_mode, audit=audit,
                                                  hide_multi_tool_calls=args.hide_multi_tool_calls,
                                                  failed_call_policy=args.failed_call_policy)
+            if args.per_task_selection != "all":
+                stats.update(traj_stats)
+                conversion_stats[(ti, si)] = traj_stats
             if traj_samples:
                 kept_trajs += 1
                 env_kept[env_id] += 1
@@ -840,6 +886,31 @@ def main():
                          "lang": info.get("lang"), "avg_result": avg, "kept": keep,
                          "reason": reason, "n_samples": n_samples,
                          "n_hidden_turns": len(audit.get("hidden_turns", [])), **audit})
+
+    if args.per_task_selection == "random-one":
+        candidate_trajs = kept_trajs
+        selected = select_one_per_task(manifest, records, args.selection_seed)
+        selected_samples = []
+        offset = 0
+        for index, row in enumerate(manifest):
+            count = row["n_samples"]
+            if index in selected:
+                selected_samples.extend(samples[offset:offset + count])
+            elif row["kept"]:
+                row.update(kept=False, reason="not_selected_per_task", n_samples=0)
+                reject_reasons["not_selected_per_task"] += 1
+                env_kept[row["env_id"]] -= 1
+                # 汇总仅保留入选轨迹及转换失败记录的审计; 未入选的逐轮审计仍在 manifest。
+                for name, value in conversion_stats[(row["task_index"], row["sample_idx"])].items():
+                    stats[name] -= value
+                    if not stats[name]:
+                        del stats[name]
+            offset += count
+        samples = selected_samples
+        kept_trajs = len(selected)
+        print(f"[2a] 每题选择(random-one, seed={args.selection_seed}): "
+              f"{candidate_trajs} 条合格可转换轨迹 → {kept_trajs} 题/{kept_trajs} 条轨迹")
+        print("    转换汇总统计仅含入选轨迹及转换失败记录; 未入选候选的审计保留在 manifest。")
 
     print(f"[2] 筛选(min_score={args.min_score}, accept_termination={sorted(accept_termination)}): "
           f"保留 {kept_trajs}/{len(records)} 条轨迹")
